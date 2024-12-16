@@ -327,7 +327,8 @@ end
 -- FadeScreens function with proper fadeTimer scope
 function obj:fadeScreens(screens, fromBrightnessTable, toBrightnessTable, callback)
     if self.isFading then
-        log("fadeScreens called while already fading")
+        log("fadeScreens called while already fading, waiting to complete")
+        -- Optional: Queue the fade request or return
         return
     end
     self.isFading = true
@@ -335,9 +336,9 @@ function obj:fadeScreens(screens, fromBrightnessTable, toBrightnessTable, callba
     
     -- Configuration for step counts and durations
     local config = {
-        externalSteps = 5,    -- Fewer steps for external displays
-        internalSteps = self.fadeSteps or 20,  -- More steps for internal displays
-        fadeDuration = self.fadeDuration or 2, -- Total fade duration in seconds
+        externalSteps = 5,
+        internalSteps = self.fadeSteps or 20,
+        fadeDuration = self.fadeDuration or 2,
     }
     
     -- Separate screens by type using self.ddcScreens
@@ -347,18 +348,14 @@ function obj:fadeScreens(screens, fromBrightnessTable, toBrightnessTable, callba
         local id = screen:id()
         if self.ddcScreens[id] then
             table.insert(externalScreens, screen)
-            log(string.format("Screen '%s' (ID: %d) categorized as external (DDC-capable)", screen:name(), id))
         else
             table.insert(internalScreens, screen)
-            log(string.format("Screen '%s' (ID: %d) categorized as internal", screen:name(), id))
         end
     end
     
-    -- Determine the total number of fading groups
-    local totalGroups = 0
+    -- Track completion
+    local totalGroups = (#internalScreens > 0 and 1 or 0) + (#externalScreens > 0 and 1 or 0)
     local completedGroups = 0
-    if #internalScreens > 0 then totalGroups = totalGroups + 1 end
-    if #externalScreens > 0 then totalGroups = totalGroups + 1 end
     
     if totalGroups == 0 then
         log("No screens to fade")
@@ -367,66 +364,61 @@ function obj:fadeScreens(screens, fromBrightnessTable, toBrightnessTable, callba
         return
     end
     
-    -- Function to handle fading for a group of screens
-    local function fadeGroup(screenGroup, fromTable, toTable, steps, stepDuration, groupName)
-        if #screenGroup == 0 then
-            return
+    -- Local function to handle group completion
+    local function onGroupComplete()
+        completedGroups = completedGroups + 1
+        if completedGroups >= totalGroups then
+            self.isFading = false
+            if callback then callback() end
         end
-        log(string.format("Starting fade for %s screens with %d steps", groupName, steps))
+    end
+    
+    -- Function to handle fading for a group of screens
+    local function fadeGroup(screenGroup, steps, stepDuration, groupName)
+        if #screenGroup == 0 then return end
         
+        log(string.format("Starting fade for %s screens with %d steps", groupName, steps))
         local currentStep = 0
-        -- Define fadeTimer as a local variable to ensure proper scope
-        local fadeTimer = hs.timer.doEvery(stepDuration, function()
+        
+        -- Create timer in local scope
+        local timer
+        timer = hs.timer.doEvery(stepDuration, function()
             currentStep = currentStep + 1
             local progress = currentStep / steps
             
             for _, screen in ipairs(screenGroup) do
                 local id = screen:id()
-                local fromB = fromTable[id] or 1.0
-                local toB = toTable[id] or 1.0
+                local fromB = fromBrightnessTable[id] or 1.0
+                local toB = toBrightnessTable[id] or 1.0
                 local currentBrightness = fromB + (toB - fromB) * progress
+                
                 self:setBrightness(screen, currentBrightness)
-                log(string.format("Fade Step %d/%d for screen '%s' (ID: %d): %.2f -> %.2f", 
-                    currentStep, steps, screen:name(), id, fromB, currentBrightness))
             end
             
             if currentStep >= steps then
-                -- Ensure exact brightness at the end
+                -- Final brightness set
                 for _, screen in ipairs(screenGroup) do
                     local id = screen:id()
-                    local toB = toTable[id] or 1.0
+                    local toB = toBrightnessTable[id] or 1.0
                     self:setBrightness(screen, toB)
-                    log(string.format("Fade completed for screen '%s' (ID: %d): set to %.2f", 
-                        screen:name(), id, toB))
                 end
-                log(string.format("Completed fade for %s screens", groupName))
-                fadeTimer:stop()
-                completedGroups = completedGroups + 1
-                if completedGroups >= totalGroups then
-                    self.isFading = false
-                    if callback then callback() end
-                end
+                
+                -- Stop timer and mark group as complete
+                timer:stop()
+                onGroupComplete()
             end
         end)
     end
     
-    -- Calculate step durations
-    local internalSteps = config.internalSteps
-    local externalSteps = config.externalSteps
-    local fadeDuration = config.fadeDuration
-    
-    -- Step duration is total fade duration divided by steps
-    local internalStepDuration = fadeDuration / internalSteps
-    local externalStepDuration = fadeDuration / externalSteps
-    
-    -- Start fading internal screens
+    -- Start fading each group
     if #internalScreens > 0 then
-        fadeGroup(internalScreens, fromBrightnessTable, toBrightnessTable, internalSteps, internalStepDuration, "internal")
+        fadeGroup(internalScreens, config.internalSteps, 
+                 config.fadeDuration / config.internalSteps, "internal")
     end
     
-    -- Start fading external screens
     if #externalScreens > 0 then
-        fadeGroup(externalScreens, fromBrightnessTable, toBrightnessTable, externalSteps, externalStepDuration, "external")
+        fadeGroup(externalScreens, config.externalSteps, 
+                 config.fadeDuration / config.externalSteps, "external")
     end
 end
 
@@ -444,47 +436,43 @@ function obj:dimScreens()
         return
     end
 
-    -- Clear and rebuild originalBrightness table only if not already dimmed
+    -- Clear and rebuild originalBrightness table
     self.originalBrightness = {}
     local validScreens = {}
     local fromBrightnessTable = {}
     local toBrightnessTable = {}
+    local dimThreshold = self.dimPercentage / 100
     
     -- First pass: collect current brightness values
     for _, screen in ipairs(screens) do
         local id = screen:id()
         local currentBrightness = self:getBrightness(screen)
-        if currentBrightness ~= nil and currentBrightness > (self.dimPercentage / 100) then
-            log(string.format("Storing original brightness for screen '%s' (ID: %d): %.2f", screen:name(), id, currentBrightness))
-            self.originalBrightness[id] = currentBrightness  -- Correctly using screen ID as key
+        
+        -- Only dim screens that are actually brighter than our dim threshold
+        if currentBrightness and currentBrightness > dimThreshold then
+            log(string.format("Screen '%s' (ID: %d) will be dimmed from %.2f to %.2f", 
+                screen:name(), id, currentBrightness, dimThreshold))
+            
+            self.originalBrightness[id] = currentBrightness
             table.insert(validScreens, screen)
             fromBrightnessTable[id] = currentBrightness
-            toBrightnessTable[id] = self.dimPercentage / 100
+            toBrightnessTable[id] = dimThreshold
         else
-            log(string.format("Screen '%s' (ID: %d) brightness (%.2f) is already at or below dim threshold; not storing original brightness", 
-                screen:name(), id, currentBrightness))
+            log(string.format("Screen '%s' (ID: %d) already at or below dim threshold (%.2f)", 
+                screen:name(), id, currentBrightness or -1))
         end
     end
 
     if #validScreens == 0 then
-        log("No screens with brightness support above dim threshold available for dimming")
+        log("No screens need dimming")
+        self.isDimmed = true  -- Mark as dimmed since all screens are already at or below threshold
         return
     end
-
-    log("Original brightness table: " .. hs.inspect(self.originalBrightness))
-    log("From brightness table: " .. hs.inspect(fromBrightnessTable))
-    log("To brightness table: " .. hs.inspect(toBrightnessTable))
 
     self:fadeScreens(validScreens, fromBrightnessTable, toBrightnessTable, function()
         self.isDimmed = true
         self.dimmedBeforeSleep = true
         log("Screens dimmed", true)
-        -- Log final state of all screens
-        for _, screen in ipairs(validScreens) do
-            local id = screen:id()
-            local b = self:getBrightness(screen)
-            log(string.format("Screen '%s' (ID: %d) final brightness: %.2f", screen:name(), id, b or -1))
-        end
     end)
 end
 
