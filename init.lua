@@ -13,7 +13,7 @@ obj.logging = true
 obj.fadeDuration = 0.5
 obj.fadeSteps = 20
 obj.checkInterval = 10
-obj.unlockGracePeriod = 5
+obj.unlockGracePeriod = 10
 obj.externalScreenNames = {
     "BenQ PD3225U"
     -- Add other external screen name patterns here
@@ -33,7 +33,7 @@ obj.lastUserAction = 0
 obj.lastUnlockTime = 0
 obj.lastUnlockEventTime = 0
 obj.unlockTimer = nil
-obj.unlockDebounceInterval = 15  -- 2 second debounce
+obj.unlockDebounceInterval = 2  -- 2 second debounce
 
 -- Logging function
 local function log(message, force)
@@ -195,25 +195,25 @@ function obj:init()
         hs.eventtap.event.types.scrollWheel
     }, function(event)
         if self.lockState then
-            log("Ignoring user action while system is locked")
             return false
         end
-
+    
         local now = hs.timer.secondsSinceEpoch()
+        
         -- Skip if we're in the unlock debounce period
         if (now - self.lastUnlockEventTime) < self.unlockDebounceInterval then
-            log("Ignoring user action during unlock debounce period")
             return false
         end
-
-        self.lastUserAction = now
-        self:userInteractionDetected()
-
+    
+        -- Only update if it's been more than 0.1 seconds since last update
+        if (now - self.lastUserAction) > 0.1 then
+            self.lastUserAction = now
+            -- log(string.format("Significant user action detected at %.1f", now))
+        end
+    
         if self.isDimmed then
             log("User action while dimmed, restoring brightness")
-            hs.timer.doAfter(0.1, function()
-                self:restoreBrightness()
-            end)
+            self:restoreBrightness()
         end
         return false
     end)
@@ -242,40 +242,57 @@ function obj:caffeineWatcherCallback(eventType)
         end
 
     elseif eventType == hs.caffeinate.watcher.screensDidUnlock then
-        -- Debounce: Skip processing if within debounce interval
         if (now - self.lastUnlockEventTime) < self.unlockDebounceInterval then
             log("Ignoring extra unlock event within debounce interval")
             return
         end
-
+        
         log("Processing unlock event")
         self.lastUnlockEventTime = now
         self.lockState = false
+        
+        -- Stop timers
+        if self.stateChecker then self.stateChecker:stop() end
+        if self.unlockTimer then self.unlockTimer:stop() end
+        
+        -- Set initial timing trackers
         self.lastUnlockTime = now
         self.lastUserAction = now
-
-        -- Stop any existing timers
-        if self.unlockTimer then self.unlockTimer:stop() end
-        if self.stateChecker then self.stateChecker:stop() end
-
-        -- Immediate brightness restore if dimmed and originalBrightness is set
-        if self.isDimmed and next(self.originalBrightness) ~= nil then
-            log("Restoring brightness after unlock")
-            self:restoreBrightness()
-        else
-            log("No need to restore brightness after unlock")
-        end
-
-        -- Force an immediate system idle reset for TouchID
-        self:userInteractionDetected()
-
-        -- Set a single timer for restarting the state checker
-        hs.timer.doAfter(self.unlockGracePeriod, function()
-            log("Re-starting state checker after unlock grace period")
-            self.lastUserAction = hs.timer.secondsSinceEpoch()  -- Reset user action time
-            if self.stateChecker then
-                self.stateChecker:start()
+        
+        -- Create a staged unlock sequence
+        log("Starting staged unlock sequence")
+        
+        -- Stage 1: Wait for macOS brightness restore
+        hs.timer.doAfter(3.5, function()
+            log("Stage 1: Delayed brightness restore starting")
+            if self.isDimmed then
+                log("Restoring brightness after system settle")
+                self:restoreBrightness()
             end
+            
+            -- Stage 2: Grace period and state reset
+            hs.timer.doAfter(self.unlockGracePeriod, function()
+                log("Stage 2: Post-unlock grace period completed")
+                
+                -- Double check brightness values
+                local screens = self:getAllScreens()
+                for _, screen in ipairs(screens) do
+                    local currentBrightness = self:getBrightness(screen)
+                    log(string.format("Screen '%s' brightness check: %.2f", 
+                        screen:name(), currentBrightness or -1))
+                end
+                
+                -- Reset timing trackers
+                local currentTime = hs.timer.secondsSinceEpoch()
+                self.lastUserAction = currentTime
+                self.lastUnlockTime = currentTime
+                
+                -- Stage 3: Resume normal operation
+                log("Stage 3: Resuming normal operation")
+                if self.stateChecker then
+                    self.stateChecker:start()
+                end
+            end)
         end)
 
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
@@ -492,6 +509,11 @@ function obj:restoreBrightness()
 
     if next(self.originalBrightness) == nil then
         log("No original brightness values stored, cannot restore")
+        -- Even if we can't restore, we should reset states
+        self.isDimmed = false
+        self.dimmedBeforeLock = false
+        self.dimmedBeforeSleep = false
+        self.isRestoring = false
         return
     end
 
@@ -519,21 +541,29 @@ function obj:restoreBrightness()
 
     if #validScreens == 0 then
         log("No screens to restore")
-        self.isRestoring = false
-        return
-    end
-
-    log("Original brightness table before restore: " .. hs.inspect(self.originalBrightness))
-    log("From brightness table: " .. hs.inspect(fromBrightnessTable))
-    log("To brightness table: " .. hs.inspect(toBrightnessTable))
-
-    self:fadeScreens(validScreens, fromBrightnessTable, toBrightnessTable, function()
-        -- Reset state flags only after fade is complete
+        -- Reset states even if no screens need restoration
         self.isDimmed = false
         self.dimmedBeforeLock = false
         self.dimmedBeforeSleep = false
-        self.lastUserAction = hs.timer.secondsSinceEpoch()
-        self.lastUnlockTime = self.lastUserAction
+        self.isRestoring = false
+        self.originalBrightness = {}
+        return
+    end
+
+    self:fadeScreens(validScreens, fromBrightnessTable, toBrightnessTable, function()
+        -- Explicitly reset ALL state flags
+        self.isDimmed = false
+        self.dimmedBeforeLock = false
+        self.dimmedBeforeSleep = false
+        self.isRestoring = false
+        
+        -- Update timing trackers
+        local now = hs.timer.secondsSinceEpoch()
+        self.lastUserAction = now
+        self.lastUnlockTime = now
+        
+        -- Clear stored brightness values
+        self.originalBrightness = {}
         
         -- Log final state of all screens
         for _, screen in ipairs(validScreens) do
@@ -541,11 +571,8 @@ function obj:restoreBrightness()
             local b = self:getBrightness(screen)
             log(string.format("Screen '%s' (ID: %d) final brightness: %.2f", screen:name(), id, b or -1))
         end
-
-        -- Clear original brightness only after successful restore
-        self.originalBrightness = {}
-        self.isRestoring = false
-        log("Brightness restored", true)
+        
+        log("Brightness restored and all states reset", true)
     end)
 end
 
@@ -580,49 +607,55 @@ end
 -- Handle user interaction
 function obj:userInteractionDetected()
     local now = hs.timer.secondsSinceEpoch()
+    local oldLastUserAction = self.lastUserAction
     self.lastUserAction = now
     
-    -- Optionally, reconcile system idle time by comparing to your lastUserAction.
+    log(string.format("User interaction detected - updating lastUserAction from %.1f to %.1f", 
+        oldLastUserAction, now))
+    
+    -- Force system idle time reset if needed
     local systemIdle = hs.host.idleTime()
-    local scriptIdle = now - self.lastUserAction
-    -- If the systemIdle is significantly larger (e.g. more than 2 seconds difference), reset it:
-    if (systemIdle - scriptIdle) > 2 then
-        -- Force a silent key press to let macOS know there's been "recent" user input
+    if systemIdle > 2 then  -- If system thinks we've been idle for more than 2 seconds
         hs.eventtap.keyStroke({}, "f15", 0)
-        log("System idle time reset via keyStroke F15")
+        log(string.format("Forced system idle reset (was %.1f seconds)", systemIdle))
     end
 end
+
 
 -- Check and update state based on idle time
 function obj:checkAndUpdateState()
     local now = hs.timer.secondsSinceEpoch()
     local timeSinceUnlock = now - (self.lastUnlockTime or 0)
     local timeSinceUserAction = now - self.lastUserAction
+    local systemIdle = hs.host.idleTime()
 
     log(string.format(
-      "Time checks - sinceUnlock: %.1f, sinceUserAction: %.1f",
-      timeSinceUnlock, timeSinceUserAction
+        "Time checks - sinceUnlock: %.1f, sinceUserAction: %.1f, systemIdle: %.1f, isDimmed: %s, isRestoring: %s",
+        timeSinceUnlock, timeSinceUserAction, systemIdle, tostring(self.isDimmed), tostring(self.isRestoring)
     ))
+
+    -- Synchronize our idle tracking with system if needed
+    if math.abs(timeSinceUserAction - systemIdle) > 2 then
+        log(string.format("Correcting idle time tracking (was %.1f, system reports %.1f)", 
+            timeSinceUserAction, systemIdle))
+        self.lastUserAction = now - systemIdle
+        timeSinceUserAction = systemIdle
+    end
 
     if self.isRestoring then
         log("Skipping state check during active brightness restoration")
         return
     end
 
-    if timeSinceUnlock < self.unlockGracePeriod then
-        log(string.format("In unlock grace period (%.1f sec remaining)",
-            self.unlockGracePeriod - timeSinceUnlock))
-        return
-    end
-
-    if now - self.lastUnlockEventTime < self.unlockDebounceInterval + 1 then
-        log("Skipping state check during unlock debounce period")
+    if timeSinceUnlock < (self.unlockGracePeriod + 5) then
+        log(string.format("In extended unlock grace period (%.1f sec remaining)",
+            self.unlockGracePeriod + 5 - timeSinceUnlock))
         return
     end
 
     local shouldDim = (timeSinceUserAction > self.idleTimeout)
-    log(string.format("Checking state - Should dim: %s, Currently dimmed: %s, scriptIdle=%.1f",
-        tostring(shouldDim), tostring(self.isDimmed), timeSinceUserAction))
+    log(string.format("Checking state - Should dim: %s, Currently dimmed: %s, scriptIdle=%.1f, systemIdle=%.1f",
+        tostring(shouldDim), tostring(self.isDimmed), timeSinceUserAction, systemIdle))
 
     if shouldDim and not self.isDimmed then
         self:dimScreens()
