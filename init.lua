@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "1.7",
+    version = "1.9",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -118,33 +118,36 @@ function obj:start(showAlert)
     return self
 end
 
-
 -- Stop the ScreenDimmer
-function obj:start(showAlert)
-    if self.state.isEnabled then
+function obj:stop(showAlert)
+    if not self.state.isEnabled then
         return self
     end
 
-    log("Starting ScreenDimmer", true)
-    self.state.isEnabled = true
+    log("Stopping ScreenDimmer", true)
+    self.state.isEnabled = false
 
-    -- Start all watchers
+    -- Stop all watchers
     if self.stateChecker then
-        self.stateChecker:start()
+        self.stateChecker:stop()
     end
     if self.userActionWatcher then
-        self.userActionWatcher:start()
+        self.userActionWatcher:stop()
     end
     if self.caffeineWatcher then
-        self.caffeineWatcher:start()
+        self.caffeineWatcher:stop()
+    end
+
+    -- Restore brightness if dimmed
+    if self.state.isDimmed then
+        self:restoreBrightness()
     end
 
     -- Reset state
     self:resetState()
-    self.state.lastUserAction = hs.timer.secondsSinceEpoch()
 
     if showAlert ~= false then
-        hs.alert.show("Screen Dimmer Started")
+        hs.alert.show("Screen Dimmer Stopped")
     end
 
     return self

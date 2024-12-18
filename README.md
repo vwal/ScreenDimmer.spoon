@@ -19,11 +19,12 @@ dimmer:configure({
 
 -- Bind hotkey
 dimmer:bindHotkeys({
-    toggle = { {"shift", "cmd", "alt", "ctrl"}, "D" }
+    toggle = { {"shift", "cmd", "alt", "ctrl"}, "D" },  -- Enable/disable the dimmer
+    dim = { {"shift", "cmd", "alt"}, "D" }              -- Immediate dim toggle
 })
 ```
 
-Above, I've set a hyperkey+D to toggle the dimmer on/off. The three configuration variables are optional (if not set here, the internal defaults are: 300 seconds inactivity timeout, dim to 10%, and debug logging on).
+Above, I've set a hyperkey+D to toggle the dimmer on/off and ⇧⎇⌘+D to dim the screen(s) immediately (note: you can define both, either, or no hotkeys). The three configuration variables are optional (if not set here, the internal defaults are: 300 seconds inactivity timeout, dim to 10%, and debug logging on). If no hotkeys are defined when calling ScreenDimmer, none are set internally.
 
 You can also set a different dimming value for internal MBP display vs. external monitors. For example:
 
