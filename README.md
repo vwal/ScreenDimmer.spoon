@@ -13,7 +13,7 @@ local dimmer = hs.loadSpoon("ScreenDimmer")
 -- Configure with desired settings
 dimmer:configure({
     idleTimeout =  240,  -- 4 minutes in seconds
-    dimPercentage = 10,  -- dim to 10%
+    dimPercentage = 10,  -- dim to 10% (internal & external)
     logging = false      -- set to 'true' to enable debug logging
 })
 
@@ -24,6 +24,22 @@ dimmer:bindHotkeys({
 ```
 
 Above, I've set a hyperkey+D to toggle the dimmer on/off. The three configuration variables are optional (if not set here, the internal defaults are: 300 seconds inactivity timeout, dim to 10%, and debug logging on).
+
+You can also set a different dimming value for internal MBP display vs. external monitors. For example:
+
+```
+-- Configure with desired settings
+dimmer:configure({
+    idleTimeout =  240,  -- 4 minutes in seconds
+    dimPercentage = {
+        internal = 10,  -- dim internal display to 10%
+        external = 0    -- dim external displays to 0%
+    },
+    logging = false      -- enable debug logging
+})
+```
+
+This differential dimming percentage was implemented because many external monitors can still be pretty bright at 10%. I have a BENQ external monitor, and at `0` luminance, it more or less matches 10% internal MBP display luminance.
 
 Tested with macOS Sequoia and Hammerspoon 1.0.0. Provided without guarantees (=use at your own risk).
 

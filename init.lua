@@ -15,7 +15,13 @@ local obj = {
         -- Target brightness level as percentage of maximum brightness
         -- e.g., 10 means dim to 10% of maximum brightness, regardless
         -- of the original level (call can override)
-        dimPercentage = 10,
+        -- dimPercentage = 10,
+
+        -- Target brightness level as percentage of maximum brightness
+        dimPercentage = {
+            internal = 10,  -- dim internal display to 10%
+            external = 0    -- dim external displays to 0%
+        },
 
         -- Enable/disable debug logging output (call can override)
         logging = true,
@@ -153,10 +159,20 @@ function obj:toggle()
     end
 end
 
+-- Toggle between dimmed and normal brightness states
+function obj:toggleDim()
+    if self.state.isDimmed then
+        self:restoreBrightness()
+    else
+        self:dimScreens()
+    end
+end
+
 -- Bind hotkeys
 function obj:bindHotkeys(mapping)
     local spec = {
-        toggle = function() self:toggle() end
+        toggle = function() self:toggle() end,
+        dim = function() self:toggleDim() end
     }
     hs.spoons.bindHotkeysToSpec(spec, mapping)
 end
@@ -222,7 +238,16 @@ function obj:init()
         log("WARNING: m1ddc verification failed!", true)
     end
     log("idleTimeout: " .. self.config.idleTimeout, true)
-    log("dimPercentage: " .. self.config.dimPercentage, true)
+    
+    -- Modified logging for dimPercentage
+    if type(self.config.dimPercentage) == "table" then
+        log(string.format("dimPercentage: internal=%d%%, external=%d%%", 
+            self.config.dimPercentage.internal,
+            self.config.dimPercentage.external), true)
+    else
+        log("dimPercentage: " .. tostring(self.config.dimPercentage), true)
+    end
+    
     log("logging: " .. tostring(self.config.logging), true)
 
     self.state.lastWakeTime = hs.timer.secondsSinceEpoch()
@@ -237,7 +262,8 @@ function obj:init()
     local allDimmed = true
     for _, screen in ipairs(screens) do
         local brightness = self:getBrightness(screen)
-        if brightness and brightness > (self.config.dimPercentage / 100) then
+        local dimThreshold = self:getDimLevel(screen)
+        if brightness and brightness > dimThreshold then
             allDimmed = false
             break
         end
@@ -384,12 +410,24 @@ end
 function obj:configure(config)
     log("Configuring variables...", true)
     if config then
-        log(".. with overrideing values.", true)
+        log(".. with overriding values.", true)
         if config.idleTimeout ~= nil then
             self.config.idleTimeout = config.idleTimeout
         end
         if config.dimPercentage ~= nil then
-            self.config.dimPercentage = config.dimPercentage
+            -- Handle both table and number formats
+            if type(config.dimPercentage) == "table" then
+                self.config.dimPercentage = {
+                    internal = config.dimPercentage.internal or 10,
+                    external = config.dimPercentage.external or 0
+                }
+            else
+                -- Convert single value to table format
+                self.config.dimPercentage = {
+                    internal = config.dimPercentage,
+                    external = config.dimPercentage
+                }
+            end
         end
         if config.logging ~= nil then
             self.config.logging = config.logging
@@ -397,7 +435,8 @@ function obj:configure(config)
 
         log("Configuration now:", true)
         log(string.format("  - idleTimeout: %s", tostring(self.config.idleTimeout)), true)
-        log(string.format("  - dimPercentage: %s", tostring(self.config.dimPercentage)), true)
+        log(string.format("  - dimPercentage internal: %s", tostring(self.config.dimPercentage.internal)), true)
+        log(string.format("  - dimPercentage external: %s", tostring(self.config.dimPercentage.external)), true)
         log(string.format("  - logging: %s", tostring(self.config.logging)), true)
     end
     return self
@@ -525,12 +564,12 @@ function obj:dimScreens()
     local validScreens = {}
     local fromBrightnessTable = {}
     local toBrightnessTable = {}
-    local dimThreshold = self.config.dimPercentage / 100
 
     -- First pass: collect current brightness values
     for _, screen in ipairs(screens) do
         local id = screen:id()
         local currentBrightness = self:getBrightness(screen)
+        local dimThreshold = self:getDimLevel(screen)  -- Get threshold for this specific screen
         
         -- Only dim screens that are actually brighter than our dim threshold
         if currentBrightness and currentBrightness > dimThreshold then
@@ -778,6 +817,19 @@ function obj:setBrightness(screen, brightness)
         -- For internal screens, use hs.screen brightness
         screen:setBrightness(brightness)
     end
+end
+
+-- Get appropriate dim level for a screen
+function obj:getDimLevel(screen)
+    if type(self.config.dimPercentage) == "table" then
+        if screen:name():match("Retina") or screen:name():match("Built-in") then
+            return self.config.dimPercentage.internal / 100
+        else
+            return self.config.dimPercentage.external / 100
+        end
+    end
+    -- Fallback to single value if not configured as table
+    return (type(self.config.dimPercentage) == "number" and self.config.dimPercentage or 10) / 100
 end
 
 -- Check and update state function
