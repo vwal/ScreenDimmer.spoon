@@ -76,6 +76,7 @@ local obj = {
         lastUserAction = 0,
         lastUnlockTime = 0,
         lastUnlockEventTime = 0,
+        screenWatcher = nil,
         unlockTimer = nil
     }
 }
@@ -136,6 +137,9 @@ function obj:stop(showAlert)
     end
     if self.caffeineWatcher then
         self.caffeineWatcher:stop()
+    end
+    if self.state.screenWatcher then
+        self.state.screenWatcher:stop()
     end
 
     -- Restore brightness if dimmed
@@ -230,6 +234,25 @@ function obj:printScreens()
     end
 end
 
+-- Detect screen attachment/detachment
+function obj:setupScreenWatcher()
+    self.state.screenWatcher = hs.screen.watcher.new(function()
+        log("Screen configuration changed", true)
+        -- Wait a brief moment for the system to stabilize
+        hs.timer.doAfter(2, function()
+            log("Refreshing DDC screen detection", true)
+            self:detectDDCCapableScreens()
+            
+            -- If screens are currently dimmed, apply dimming to new screens
+            if self.state.isDimmed then
+                log("Screens were dimmed, applying dim to new configuration")
+                self:dimScreens()
+            end
+        end)
+    end)
+    self.state.screenWatcher:start()
+end
+
 -- Initialize the ScreenDimmer
 function obj:init()
     if self.state.isInitialized then
@@ -259,6 +282,9 @@ function obj:init()
 
     -- Detect DDC-capable screens
     self:detectDDCCapableScreens()
+
+    -- Setup screen watcher
+    self:setupScreenWatcher()
 
     -- Initialize isDimmed based on current screen brightness
     local screens = self:getAllScreens()
