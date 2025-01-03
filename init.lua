@@ -36,7 +36,7 @@ local obj = {
         displayPriorities = {}
         -- Example:
         -- displayPriorities = {
-        --     ["Built-in Retina Display"] = 1,
+        --     ["Built-in"] = 1,
         --     ["BenQ PD3225U"] = 2,
         --     ["LG Ultra HD"] = 3
         -- }
