@@ -13,24 +13,33 @@ local obj = {
     -- Configuration
     config = {
         -- Number of seconds of user inactivity before screens dim
-        idleTimeout = 300,  -- 5 minutes (call can override)
+        idleTimeout = 300,  -- 5 minutes
 
         -- Target brightness level (-100 to 100)
-        -- Negative values use subzero mode
+        -- Negative values use subzero (gamma mode)
         -- Positive values use regular brightness
         dimLevel = -30,  -- This means subzero mode at 0.7 (or 70%)
 
         -- Internal display ± gain level (added to dimLevel)
         internalDisplayGainLevel = 0,  -- No gain by default
 
-        -- Enable/disable debug logging output (call can override)
-        logging = true,
+        -- Enable/disable expanded debug logging output
+        logging = false,
 
         -- How often (in seconds) to check system state for idle timeout
         checkInterval = 5,
 
         -- Minimum time (in seconds) between processing unlock events
-        unlockDebounceInterval = 0.5
+        unlockDebounceInterval = 0.5,
+
+        -- Optional dimming/undimmg priorities for specific displays
+        displayPriorities = {}
+        -- Example:
+        -- displayPriorities = {
+        --     ["Built-in Retina Display"] = 1,
+        --     ["BenQ PD3225U"] = 2,
+        --     ["LG Ultra HD"] = 3
+        -- }
     },
     
     -- State variables
@@ -80,13 +89,33 @@ function obj:getLunarDisplayNames()
             if name == "Built-in" then
                 displays["Built-in Retina Display"] = "Built-in"
             end
-            log(string.format("Added display mapping: %s -> %s", name, displays[name]), true)
+            log(string.format("Added display mapping: %s -> %s", name, displays[name]))
         end
     end
     
     -- Cache the mappings
     self.displayMappings = displays
     return displays
+end
+
+function obj:sortScreensByPriority(screens)
+    -- If no priorities configured, return screens in original order
+    if not self.config.displayPriorities or not next(self.config.displayPriorities) then
+        return screens
+    end
+    
+    local prioritizedScreens = {}
+    for _, screen in ipairs(screens) do
+        table.insert(prioritizedScreens, screen)
+    end
+    
+    table.sort(prioritizedScreens, function(a, b)
+        local priorityA = self.config.displayPriorities[a:name()] or self.config.defaultDisplayPriority
+        local priorityB = self.config.displayPriorities[b:name()] or self.config.defaultDisplayPriority
+        return priorityA < priorityB
+    end)
+    
+    return prioritizedScreens
 end
 
 -- Get brightness for a screen
@@ -109,16 +138,16 @@ function obj:getBrightness(screen)
         return false
     end
 
-    log(string.format("Raw brightness command output for '%s':", screenName), true)
-    log(output or "nil", true)
-    log("Command status: " .. tostring(status), true)
-    log("Command executed: " .. command, true)
+    log(string.format("Raw brightness command output for '%s':", screenName))
+    log(output or "nil")
+    log("Command status: " .. tostring(status))
+    log("Command executed: " .. command)
 
     if status then
         local brightness = output:match("brightness:%s*(%d+)")
         if brightness then
             local value = tonumber(brightness)
-            log(string.format("Parsed brightness value: %d", value), true)
+            log(string.format("Parsed brightness value: %d", value))
             return value
         end
     end
@@ -185,8 +214,8 @@ function obj:dimScreens()
         return
     end
     
-    log("dimScreens called", true)
-    local screens = hs.screen.allScreens()
+    log("dimScreens called")
+    local screens = self:sortScreensByPriority(hs.screen.allScreens())
     if #screens == 0 then
         log("No screens to dim")
         return
@@ -217,7 +246,7 @@ function obj:dimScreens()
     
     self.state.isDimmed = true
     self.state.dimmedBeforeSleep = true
-    log("Screens dimmed", true)
+    log("Screens dimmed")
 end
 
 -- Restore brightness function
@@ -232,23 +261,46 @@ function obj:restoreBrightness()
         return
     end
 
-    log("restoreBrightness called", true)
+    log("restoreBrightness called")
     
-    local screens = hs.screen.allScreens()
+    self.state.isRestoring = true
+    
+    local screens = self:sortScreensByPriority(hs.screen.allScreens())
     for _, screen in ipairs(screens) do
-        local originalBrightness = self.state.originalBrightness[screen:name()]
-        if originalBrightness then
-            -- First disable subzero mode
-            local cmd1 = string.format("%s displays \"%s\" subzero false", 
-                self.lunarPath, screen:name())
+        local screenName = screen:name()
+        local lunarDisplays = self:getLunarDisplayNames()
+        local lunarName = lunarDisplays[screenName]
+        local originalBrightness = self.state.originalBrightness[screenName]
+        
+        if originalBrightness and lunarName then
+            log(string.format("Restoring brightness for '%s' (lunar name: '%s') to %d", 
+                screenName, lunarName, originalBrightness))
+
+            -- First set the target brightness while still in subzero mode
+            local cmd1 = string.format("%s displays \"%s\" brightness %d", 
+                self.lunarPath, lunarName, originalBrightness)
+            
+            log("Executing: " .. cmd1)
             local success, result = pcall(hs.execute, cmd1)
             if not success then
-                log(string.format("Error executing Lunar command: %s", result), true)
-                return false
+                log(string.format("Error setting brightness: %s", result), true)
             end
 
-            -- Then restore original brightness
-            self:setBrightness(screen, originalBrightness)
+            -- Small delay
+            hs.timer.usleep(200000)  -- 0.2 seconds
+
+            -- Then disable subzero mode
+            local cmd2 = string.format("%s displays \"%s\" subzero false", 
+                self.lunarPath, lunarName)
+            
+            log("Executing: " .. cmd2)
+            success, result = pcall(hs.execute, cmd2)
+            if not success then
+                log(string.format("Error disabling subzero mode: %s", result), true)
+            end
+
+            -- Wait between screens if there are multiple
+            hs.timer.usleep(200000)  -- 0.2 seconds
         end
     end
 
@@ -257,14 +309,20 @@ function obj:restoreBrightness()
     self.state.dimmedBeforeLock = false
     self.state.dimmedBeforeSleep = false
     self.state.originalBrightness = {}
-    log("Brightness restored", true)
+    
+    -- Clear the restoration flag
+    hs.timer.doAfter(1, function()
+        self.state.isRestoring = false
+    end)
+    
+    log("Brightness restored")
 end
 
 -- Initialize ScreenDimmer
 function obj:init()
     if self.state.isInitialized then
         if self.config.logging then
-            log("Already initialized, returning", true)
+            log("Already initialized, returning")
         end
         return self
     end
@@ -309,7 +367,7 @@ function obj:init()
         hs.eventtap.event.types.rightMouseDown,
         hs.eventtap.event.types.mouseMoved
     }, function(event)
-        if self.state.lockState or self.state.isUnlocking then
+        if self.state.lockState or self.state.isUnlocking or self.state.isRestoring then
             return false
         end
     
@@ -344,7 +402,7 @@ function obj:init()
     end)
 
     if self.config.logging then
-        log("Basic initialization complete", true)
+        log("Basic initialization complete")
     end
     
     return self
@@ -354,16 +412,37 @@ end
 function obj:setupScreenWatcher()
     self.state.screenWatcher = hs.screen.watcher.new(function()
         log("Screen configuration changed", true)
+        
+        -- Clear the display mappings cache
+        self:clearDisplayCache()
+        
+        -- Log current screen configuration
+        local screens = hs.screen.allScreens()
+        log(string.format("New screen configuration detected: %d display(s)", #screens))
+        for _, screen in ipairs(screens) do
+            log(string.format("- Display: %s", screen:name()))
+        end
+        
         -- Wait a brief moment for the system to stabilize
         hs.timer.doAfter(2, function()
-            -- If screens are currently dimmed, reapply dimming to all screens
+            -- If screens were dimmed, reapply dimming to all screens
             if self.state.isDimmed then
-                log("Screens were dimmed, reapplying dim to new configuration")
-                self:dimScreens()
+                log("Reapplying dim settings to new screen configuration")
+                -- Store current dim state
+                local wasDimmed = self.state.isDimmed
+                -- Reset dim state temporarily
+                self.state.isDimmed = false
+                -- Reapply dimming
+                if wasDimmed then
+                    self:dimScreens()
+                end
+            else
+                log("Screens were not dimmed, no action needed")
             end
         end)
     end)
     self.state.screenWatcher:start()
+    log("Screen watcher initialized and started")
 end
 
 -- Check and update state function
@@ -377,17 +456,16 @@ function obj:checkAndUpdateState()
         return
     end
 
-    local idleTime = hs.host.idleTime()
+    local now = hs.timer.secondsSinceEpoch()
+    local timeSinceLastAction = now - self.state.lastUserAction
 
     if self.config.logging then
-        log(string.format("Current idle time: %.1f seconds (timeout: %d)", 
-            idleTime, self.config.idleTimeout))
+        log(string.format("timeSinceLastAction = %.1f seconds (timeout: %d)",
+                          timeSinceLastAction, self.config.idleTimeout))
     end
 
-    if idleTime >= self.config.idleTimeout then
+    if timeSinceLastAction >= self.config.idleTimeout then
         if not self.state.isDimmed then
-            log(string.format("System idle for %.1f seconds, dimming screens", 
-                idleTime))
             self:dimScreens()
         end
     end
@@ -395,9 +473,9 @@ end
 
 -- Configuration function
 function obj:configure(config)
-    log("Configuring variables...", true)
+    log("Configuring variables...")
     if config then
-        log(".. with overriding values.", true)
+        log(".. with overriding values:")
         -- Apply all configurations
         for k, v in pairs(config) do
             self.config[k] = v
@@ -598,19 +676,18 @@ function obj:caffeineWatcherCallback(eventType)
 
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
         self.state.lastWakeTime = now
+        -- Reset *our* lastUserAction so we do NOT see an immediate idle
         self.state.lastUserAction = now
-        
-        if self.stateChecker then 
-            self.stateChecker:stop() 
+    
+        if self.stateChecker then
+            self.stateChecker:stop()
         end
-
-        -- Restore brightness if needed
+    
         if self.state.dimmedBeforeSleep then
             log("Woke from sleep, was dimmed, restoring brightness")
             self:restoreBrightness()
         end
         
-        -- Reset state and resume normal operation after a delay
         self:resetState()
         hs.timer.doAfter(2, function()
             if self.stateChecker then
