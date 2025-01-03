@@ -63,7 +63,7 @@ function obj:getLunarDisplayNames()
     if self.displayMappings then
         return self.displayMappings
     end
-
+   
     local command = string.format("%s displays", self.lunarPath)
     local output, status = hs.execute(command)
     
@@ -101,8 +101,14 @@ function obj:getBrightness(screen)
     end
 
     local command = string.format("%s displays \"%s\" brightness", self.lunarPath, lunarName)
-    local output, status = hs.execute(command)
-    
+
+
+    local success, output, status = pcall(hs.execute, command)
+    if not success then
+        log(string.format("Error executing Lunar command: %s", status), true)
+        return false
+    end
+
     log(string.format("Raw brightness command output for '%s':", screenName), true)
     log(output or "nil", true)
     log("Command status: " .. tostring(status), true)
@@ -136,7 +142,12 @@ function obj:setBrightness(screen, targetValue)
         -- For negative values, just set subzero dimming
         local cmd = string.format("%s displays \"%s\" subzeroDimming %.2f", 
             self.lunarPath, lunarName, (100 + targetValue) / 100)
-        hs.execute(cmd)
+
+        local success, result = pcall(hs.execute, cmd)
+        if not success then
+            log(string.format("Error executing Lunar command: %s", result), true)
+            return false
+        end
         
         log(string.format("Set subzero brightness for '%s': %.2f", 
             screenName, (100 + targetValue) / 100))
@@ -150,7 +161,11 @@ function obj:setBrightness(screen, targetValue)
         }
         
         for _, cmd in ipairs(commands) do
-            hs.execute(cmd)
+            local success, result = pcall(hs.execute, cmd)
+            if not success then
+                log(string.format("Error executing Lunar command: %s", result), true)
+                return false
+            end
         end
         
         log(string.format("Set regular brightness for '%s': %d", 
@@ -226,8 +241,12 @@ function obj:restoreBrightness()
             -- First disable subzero mode
             local cmd1 = string.format("%s displays \"%s\" subzero false", 
                 self.lunarPath, screen:name())
-            hs.execute(cmd1)
-            
+            local success, result = pcall(hs.execute, cmd1)
+            if not success then
+                log(string.format("Error executing Lunar command: %s", result), true)
+                return false
+            end
+
             -- Then restore original brightness
             self:setBrightness(screen, originalBrightness)
         end
@@ -319,21 +338,6 @@ function obj:init()
         return false
     end)
 
-    -- Setup idle timer
-    self.idleTimer = hs.timer.new(self.config.checkInterval, function()
-        local idleTime = hs.host.idleTime()
-        if self.config.logging then
-            log(string.format("Current idle time: %.1f seconds (timeout: %d)", 
-                idleTime, self.config.idleTimeout))
-        end
-        
-        if idleTime >= self.config.idleTimeout then
-            if not self.state.isDimmed then
-                self:dimScreens()
-            end
-        end
-    end)
-
     -- Setup caffeine watcher
     self.caffeineWatcher = hs.caffeinate.watcher.new(function(eventType)
         self:caffeineWatcherCallback(eventType)
@@ -373,8 +377,7 @@ function obj:checkAndUpdateState()
         return
     end
 
-    local now = hs.timer.secondsSinceEpoch()
-    local idleTime = now - self.state.lastUserAction
+    local idleTime = hs.host.idleTime()
 
     if self.config.logging then
         log(string.format("Current idle time: %.1f seconds (timeout: %d)", 
