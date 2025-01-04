@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.0",
+    version = "4.1",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -56,7 +56,11 @@ local obj = {
         lastUnlockTime = 0,
         lastUnlockEventTime = 0,
         screenWatcher = nil,
-        unlockTimer = nil
+        unlockTimer = nil,
+        isHotkeyDimming = false,
+        isScreenSaverActive = false,
+        inScreenSaverRecovery = false,
+        lastScreenSaverEvent = hs.timer.secondsSinceEpoch()
     }
 }
 
@@ -373,10 +377,14 @@ function obj:init()
     
         local now = hs.timer.secondsSinceEpoch()
     
-        -- Strict ignore period after dimming
-        if (now - self.state.lastHotkeyTime) < 2.0 then
+        -- Add safety check for lastScreenSaverEvent
+        local screenSaverCooldown = (self.state.lastScreenSaverEvent and 
+            (now - self.state.lastScreenSaverEvent) < 3.0)
+    
+        -- Strict ignore period after hotkey or screen events
+        if (now - self.state.lastHotkeyTime) < 2.0 or screenSaverCooldown then
             if self.config.logging then
-                log("Ignoring user activity during hotkey cooldown period")
+                log("Ignoring user activity during cooldown period")
             end
             return false
         end
@@ -385,7 +393,7 @@ function obj:init()
         if (now - self.state.lastUserAction) > 0.1 then
             self.state.lastUserAction = now
     
-            if self.state.isDimmed then
+            if self.state.isDimmed and not self.state.isHotkeyDimming then
                 if self.config.logging then
                     log("User action while dimmed, restoring brightness")
                 end
@@ -410,7 +418,21 @@ end
 
 -- Setup screen watcher
 function obj:setupScreenWatcher()
+    self.state.lastScreenChangeTime = 0
+    self.state.screenChangeDebounceInterval = 1.0  -- 1 second
+
     self.state.screenWatcher = hs.screen.watcher.new(function()
+        local now = hs.timer.secondsSinceEpoch()
+        
+        -- Debounce rapid screen change events
+        if (now - self.state.lastScreenChangeTime) < self.state.screenChangeDebounceInterval then
+            if self.config.logging then
+                log("Debouncing rapid screen configuration change")
+            end
+            return
+        end
+        
+        self.state.lastScreenChangeTime = now
         log("Screen configuration changed", true)
         
         -- Clear the display mappings cache
@@ -603,12 +625,32 @@ end
 
 -- Toggle between dimmed and normal brightness states
 function obj:toggleDim()
-    self.state.lastHotkeyTime = hs.timer.secondsSinceEpoch()
+    local now = hs.timer.secondsSinceEpoch()
+    self.state.lastHotkeyTime = now
+    
+    -- Set flag to indicate dimming was triggered by hotkey
+    self.state.isHotkeyDimming = true
+    
+    -- If we're coming from screensaver, ensure proper state reset
+    if self.state.isScreenSaverActive then
+        self.state.isScreenSaverActive = false
+        self.state.lastUserAction = now
+        -- Ensure any existing dimming is cleared
+        if self.state.isDimmed then
+            self:restoreBrightness()
+        end
+    end
+    
     if self.state.isDimmed then
         self:restoreBrightness()
     else
         self:dimScreens()
     end
+    
+    -- Clear the hotkey dimming flag after a short delay
+    hs.timer.doAfter(2.0, function()
+        self.state.isHotkeyDimming = false
+    end)
 end
 
 -- Bind hotkeys
@@ -635,7 +677,34 @@ function obj:caffeineWatcherCallback(eventType)
     log("Caffeinate event: " .. eventType, true)
     local now = hs.timer.secondsSinceEpoch()
 
-    if eventType == hs.caffeinate.watcher.screensDidLock then
+    if eventType == hs.caffeinate.watcher.screensaverDidStart then
+        log("Screensaver started", true)
+        self.state.isScreenSaverActive = true
+        self.state.lastScreenSaverEvent = now
+        -- Stop the state checker while screensaver is active
+        if self.stateChecker then
+            self.stateChecker:stop()
+        end
+        
+    elseif eventType == hs.caffeinate.watcher.screensaverDidStop then
+        log("Screensaver stopped", true)
+        self.state.isScreenSaverActive = false
+        self.state.lastScreenSaverEvent = now
+        self.state.lastUserAction = now
+        
+        -- Ensure clean state
+        if self.state.isDimmed then
+            self:restoreBrightness()
+        end
+        
+        -- Restart the state checker after a delay
+        hs.timer.doAfter(3, function()
+            if self.stateChecker then
+                self.stateChecker:start()
+            end
+        end)
+
+    elseif eventType == hs.caffeinate.watcher.screensDidLock then
         self.state.lockState = true
         if self.state.isDimmed then
             self.state.dimmedBeforeLock = true
@@ -668,7 +737,7 @@ function obj:caffeineWatcherCallback(eventType)
         end
         
         -- Resume normal operation after a delay
-        hs.timer.doAfter(2, function()
+        hs.timer.doAfter(3, function()
             if self.stateChecker then
                 self.stateChecker:start()
             end
