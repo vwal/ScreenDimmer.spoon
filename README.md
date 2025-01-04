@@ -1,10 +1,10 @@
 # macOS screen dimmer spoon (m1ddc version)
 
-**NOTE:** This was the first version of the Screen Dimmer spoon. This version utilizes the [`m1ddc`](https://github.com/waydabber/m1ddc) utility. While m1ddc works with many/most modern monitors, it doesn't support all DDC-capable monitors. For this reason, I rewrote this script for [Lunar](https://lunar.fyi/) CLI, which has more complete DDC support and built-in gamma support ("subzero"). The latest version that utilizes Lunar CLI can be found in the parent directory.
+**NOTE:** This was the first version of the Screen Dimmer spoon. This version utilizes the **[`m1ddc`](https://github.com/waydabber/m1ddc)** utility. While m1ddc works with many/most modern monitors, it doesn't support all DDC-capable monitors. For this reason, I rewrote this script for **[Lunar](https://lunar.fyi/)** CLI, which has more complete DDC support and built-in gamma support ("subzero"). The latest Lunar CLI version can be found in the `master` branch of this repository.
 
 ---
 
-This is a Lua script "spoon" for [Hammerspoon](https://www.hammerspoon.org/) to dim MacBook Pro's internal screen and any external DCC-compatible monitors to a preset luminosity (10% by default) after a preset period of inactivity (5 minutes by default) has elapsed.
+This is a Lua script "spoon" for **[Hammerspoon](https://www.hammerspoon.org/)** to dim MacBook Pro's internal screen and any external DDC-compatible monitors to a preset luminosity (10% by default) after a preset period of inactivity (5 minutes by default) has elapsed.
 
 I use this when I don't want to use the screen saver and/or screen sleep, but, on the other hand, I don't want to keep the screen at normal brightness when I don't actively use the system. The original brightness is restored on the first user interaction (keyboard/mouse/trackpad). Handles brightness restoration correctly after screen saver, lock-screen, and screen sleep.
 
