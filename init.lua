@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.1",
+    version = "4.2",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -18,10 +18,13 @@ local obj = {
         -- Target brightness level (-100 to 100)
         -- Negative values use subzero (gamma mode)
         -- Positive values use regular brightness
-        dimLevel = -30,  -- This means subzero mode at 0.7 (or 70%)
+        dimLevel = 10,
 
         -- Internal display ± gain level (added to dimLevel)
         internalDisplayGainLevel = 0,  -- No gain by default
+
+        -- The default path for Lunar CLI command
+        lunarPath = "~/.local/bin/lunar",
 
         -- Enable/disable expanded debug logging output
         logging = false,
