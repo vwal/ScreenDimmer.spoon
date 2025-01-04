@@ -1,8 +1,8 @@
 # macOS screen dimmer spoon
 
-A Lua "spoon" script for **[Hammerspoon](https://www.hammerspoon.org/)** to dim MacBook Pro's internal screen and any external DCC-compatible monitors to a preset luminosity (10% by default) after a preset period of inactivity (5 minutes by default) has elapsed.
+A Lua "spoon" script for **[Hammerspoon](https://www.hammerspoon.org/)** to dim MacBook Pro's internal screen and any external DDC-compatible monitors to a preset luminosity (10% by default) after a preset period of inactivity (5 minutes by default) has elapsed.
 
-NOTE: This new version has been rewritten to use **[Lunar Pro](https://lunar.fyi/)** CLI utility, `lunar`. As a result, this script now supports all DCC-capable monitors. Some additional features have also been implemented, as outlined below. 
+NOTE: This new version has been rewritten to use **[Lunar Pro](https://lunar.fyi/)** CLI utility, `lunar`. As a result, this script now supports all DDC-capable monitors. Some additional features have also been implemented, as outlined below. 
 
 - The gamma mode ("subzero") is supported via Lunar's capability. `dimLevel` values 1-100 correspond to the hardware-based brightness, whereas values -1 through -100 correspond to the gamma shader values.
 - The optional `internalDisplayGainLevel` sets the MacBook Pro's internal display to a different dimness level from the external monitor(s). You can define a positive or negative value. However, a positive value is usually used because the internal display tends to appear darker than external monitors at the same `dimLevel`.
@@ -15,7 +15,7 @@ I use this script when I don't want to use the screen saver and/or screen sleep,
 
 First, make sure you have Lunar Pro installed and then select from its toolbar menu: `Advanced Features` → `Install CLI integration`. This will install the `lunar` CLI utility at `~/.local/bin/lunar`
 
-If you don't want to use Lunar Pro's CLI utility, switch to the `m1ddc-based` branch (after cloning the repository as outlined below, change to the `ScreenDimmer.spoon` directory and execute `git checkout --track origin/m1ddc-based`. This branch works with `m1ddc,` a FOSS utility (install with `brew install m1ddc`). Note: The old `m1ddc-based` version works fine but has fewer features and doesn't support as many DCC-capable monitors (see README.md in that branch for further details).
+If you don't want to use Lunar Pro's CLI utility, switch to the `m1ddc-based` branch (after cloning the repository as outlined below, change to the `ScreenDimmer.spoon` directory and execute `git checkout --track origin/m1ddc-based`. This branch works with `m1ddc,` a FOSS utility (install with `brew install m1ddc`). Note: The old `m1ddc-based` version works fine but has fewer features and doesn't support as many DDC-capable monitors (see README.md in that branch for further details).
 
 Make sure you have [Hammerspoon](https://www.hammerspoon.org/) installed, then clone this repository:
 
