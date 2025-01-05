@@ -39,12 +39,14 @@ dimmer:configure({
     idleTimeout = 300,  -- 5 minutes in seconds, adjust as needed
     dimLevel = -75,     -- negative values use "subzero", i.e. gamma shader
     logging = false,    -- set to `true` for debug logging
-    lunarPath = "~/.local/bin/lunar", -- optional variable to set the location of the `lunar` CLI command
-                                      -- if it's at a non-standard location (see `which lunar`)
-    internalDisplayGainLevel = 50,    -- optional variable to dim the internal display to a different
-                                      -- level than set with `dimLevel`, i.e., here to -25
-    displayPriorities = {  -- example optional monitor priorities to alter the default order of
-                           -- brightness adjustment; get your monitor names with `lunar displays`
+    lunarPath = "~/.local/bin/lunar", -- optional variable to set the location of the `lunar`
+                                      -- CLI command if it's at a non-standard location
+    internalDisplayGainLevel = 50,    -- optional variable to dim the internal display to
+                                      -- a different level than what is set with `dimLevel`.
+                                      -- In this example to -25.
+    displayPriorities = {  -- example optional monitor priorities to alter the default
+                           -- order of brightness adjustment; get your monitor names
+                           -- with `lunar displays`
         ["Built-in"] = 1,
         ["BenQ PD3225U"] = 2,
         ["LG Ultra HD"] = 3
