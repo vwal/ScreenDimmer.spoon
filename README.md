@@ -17,9 +17,9 @@ First, make sure you have Lunar Pro installed and then select from its toolbar m
 
 If you don't want to use Lunar Pro's CLI utility, switch to the `m1ddc-based` branch (after cloning the repository as outlined below, change to the `ScreenDimmer.spoon` directory and execute `git checkout --track origin/m1ddc-based`. This branch works with `m1ddc,` a FOSS utility (install with `brew install m1ddc`). Note: The old `m1ddc-based` version works fine but has fewer features and doesn't support as many DDC-capable monitors (see README.md in that branch for further details).
 
-Make sure you have [Hammerspoon](https://www.hammerspoon.org/) installed, then clone this repository:
+Make sure you have [Hammerspoon](https://www.hammerspoon.org/) installed, then clone this repository in the Spoons directory:
 
-```shell
+```
 cd ~/.hammerspoon
 mkdir Spoons
 cd Spoons
