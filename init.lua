@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.2",
+    version = "4.3",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -337,7 +337,12 @@ function obj:init()
     if self.config.logging then
         log("Initializing ScreenDimmer", true)
     end
-    
+
+    if not self:checkAccessibility() then
+        log("Waiting for accessibility permissions...", true)
+        return self
+    end
+
     -- Initialize basic state
     self.state = {
         isInitialized = false,  -- Will be set to true after successful configuration
@@ -554,7 +559,30 @@ function obj:start(showAlert)
     log("Starting ScreenDimmer", true)
     self.state.isEnabled = true
 
-    -- Start all watchers
+    -- Try to start the userActionWatcher with retries
+    local maxRetries = 3
+    local retryDelay = 2 -- seconds
+    local retryCount = 0
+    
+    local function startWatcher()
+        if self.userActionWatcher then
+            local success = self.userActionWatcher:start()
+            if not success then
+                retryCount = retryCount + 1
+                if retryCount <= maxRetries then
+                    log(string.format("Retry %d/%d: Failed to start eventtap, retrying in %d seconds...", 
+                        retryCount, maxRetries, retryDelay))
+                    hs.timer.doAfter(retryDelay, startWatcher)
+                else
+                    log("Failed to start eventtap after all retries. Please check Accessibility permissions.", true)
+                end
+            end
+        end
+    end
+    
+    startWatcher()
+
+    -- Start all other watchers
     if self.stateChecker then
         self.stateChecker:start()
     end
@@ -751,6 +779,11 @@ function obj:caffeineWatcherCallback(eventType)
         -- Reset *our* lastUserAction so we do NOT see an immediate idle
         self.state.lastUserAction = now
     
+        if not self:checkAccessibility() then
+            log("Accessibility permissions lost after wake, attempting recovery...", true)
+            return
+        end
+
         if self.stateChecker then
             self.stateChecker:stop()
         end
@@ -767,6 +800,30 @@ function obj:caffeineWatcherCallback(eventType)
             end
         end)
     end
+end
+
+function obj:checkAccessibility()
+    if not hs.accessibilityState() then
+        log("Accessibility permissions not granted. Attempting to recover...", true)
+        hs.alert.show("⚠️ Hammerspoon needs Accessibility permissions\nPlease check System Settings", 5)
+        
+        -- Open System Settings to the right page
+        hs.execute([[open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]])
+        
+        -- Set up a watcher to detect when permissions are granted
+        local watcherId
+        watcherId = hs.accessibilityStateCallback(function()
+            if hs.accessibilityState() then
+                log("Accessibility permissions granted, reinitializing...", true)
+                -- Remove the watcher
+                if watcherId then hs.accessibilityStateCallback(watcherId) end
+                -- Restart the components that need accessibility
+                self:stop(false)
+                self:start(false)
+            end
+        end)
+    end
+    return hs.accessibilityState()
 end
 
 return obj
