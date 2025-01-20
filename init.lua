@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.3",
+    version = "4.4",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -36,13 +36,15 @@ local obj = {
         unlockDebounceInterval = 0.5,
 
         -- Optional dimming/undimmg priorities for specific displays
-        displayPriorities = {}
+        displayPriorities = {},
         -- Example:
         -- displayPriorities = {
         --     ["Built-in"] = 1,
         --     ["BenQ PD3225U"] = 2,
         --     ["LG Ultra HD"] = 3
         -- }
+        -- Default priority for displays not specified in displayPriorities
+        defaultDisplayPriority = 999
     },
     
     -- State variables
@@ -121,6 +123,15 @@ function obj:sortScreensByPriority(screens)
         local priorityB = self.config.displayPriorities[b:name()] or self.config.defaultDisplayPriority
         return priorityA < priorityB
     end)
+    
+    -- Log the priority order if logging is enabled
+    if self.config.logging then
+        log("Display priority order:")
+        for i, screen in ipairs(prioritizedScreens) do
+            local priority = self.config.displayPriorities[screen:name()] or self.config.defaultDisplayPriority
+            log(string.format("  %d. %s (priority: %d)", i, screen:name(), priority))
+        end
+    end
     
     return prioritizedScreens
 end
@@ -253,11 +264,19 @@ function obj:dimScreens()
     
     self.state.isDimmed = true
     self.state.dimmedBeforeSleep = true
+    self.state.failedRestoreAttempts = 0
     log("Screens dimmed")
 end
 
 -- Restore brightness function
 function obj:restoreBrightness()
+    if self.state.failedRestoreAttempts and self.state.failedRestoreAttempts >= 2 then
+        log("Multiple restore attempts failed, performing emergency reset", true)
+        self:emergencyReset()
+        self.state.failedRestoreAttempts = 0
+        return
+    end
+
     if self.state.lockState then
         log("Skipping brightness restore while system is locked")
         return
@@ -283,46 +302,146 @@ function obj:restoreBrightness()
             log(string.format("Restoring brightness for '%s' (lunar name: '%s') to %d", 
                 screenName, lunarName, originalBrightness))
 
-            -- First set the target brightness while still in subzero mode
-            local cmd1 = string.format("%s displays \"%s\" brightness %d", 
-                self.lunarPath, lunarName, originalBrightness)
-            
-            log("Executing: " .. cmd1)
-            local success, result = pcall(hs.execute, cmd1)
-            if not success then
-                log(string.format("Error setting brightness: %s", result), true)
-            end
-
-            -- Small delay
-            hs.timer.usleep(200000)  -- 0.2 seconds
-
-            -- Then disable subzero mode
-            local cmd2 = string.format("%s displays \"%s\" subzero false", 
+            -- First explicitly disable subzero mode
+            local cmdReset = string.format("%s displays \"%s\" subzero false", 
                 self.lunarPath, lunarName)
             
-            log("Executing: " .. cmd2)
-            success, result = pcall(hs.execute, cmd2)
+            log("Executing reset: " .. cmdReset)
+            local success, result = pcall(hs.execute, cmdReset)
             if not success then
-                log(string.format("Error disabling subzero mode: %s", result), true)
+                log(string.format("Error resetting subzero mode: %s", result), true)
+                -- Try failsafe reset
+                self:resetDisplayState(lunarName)
             end
 
+            -- Small delay after reset
+            hs.timer.usleep(300000)  -- 0.3 seconds
+
+            -- Then set the target brightness
+            local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
+                self.lunarPath, lunarName, originalBrightness)
+            
+            log("Executing: " .. cmdBrightness)
+            success, result = pcall(hs.execute, cmdBrightness)
+            if not success then
+                log(string.format("Error setting brightness: %s", result), true)
+                -- Try failsafe reset
+                self:resetDisplayState(lunarName)
+            end
+
+            -- Verify the changes took effect
+            hs.timer.doAfter(0.5, function()
+                local currentBrightness = self:getBrightness(screen)
+                if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
+                    log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
+                    self:resetDisplayState(lunarName)
+                end
+            end)
+
+            hs.timer.doAfter(0.5, function()
+                local currentBrightness = self:getBrightness(screen)
+                if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
+                    log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
+                    self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
+                    self:resetDisplayState(lunarName)
+                end
+            end)
+
             -- Wait between screens if there are multiple
-            hs.timer.usleep(200000)  -- 0.2 seconds
+            hs.timer.usleep(300000)  -- 0.3 seconds
         end
     end
 
-    -- Reset state
+    -- Reset most state immediately
     self.state.isDimmed = false
     self.state.dimmedBeforeLock = false
     self.state.dimmedBeforeSleep = false
     self.state.originalBrightness = {}
     
-    -- Clear the restoration flag
-    hs.timer.doAfter(1, function()
+    -- Create a verification tracker
+    local screensToVerify = #screens
+    local verificationsPassed = 0
+    
+    -- Verify each screen's brightness
+    for _, screen in ipairs(screens) do
+        local screenName = screen:name()
+        local originalBrightness = self.state.originalBrightness[screenName]
+        
+        hs.timer.doAfter(0.5, function()
+            local currentBrightness = self:getBrightness(screen)
+            if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
+                log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
+                self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
+                self:resetDisplayState(lunarName)
+            else
+                verificationsPassed = verificationsPassed + 1
+                
+                -- If all screens verified successfully, reset the failure counter
+                if verificationsPassed == screensToVerify then
+                    log("All screens verified successfully, resetting failure counter")
+                    self.state.failedRestoreAttempts = 0
+                end
+            end
+        end)
+    end
+    
+    -- Clear the restoration flag after all verifications should be complete
+    hs.timer.doAfter(1.5, function()
         self.state.isRestoring = false
     end)
     
-    log("Brightness restored")
+    log("Brightness restore completed")
+end
+
+-- Failsafe to make sure subzero (gamma) is disabled
+function obj:resetDisplayState(lunarName)
+    log(string.format("Attempting failsafe reset for display: %s", lunarName), true)
+    
+    -- First try the normal reset commands
+    local resetCommands = {
+        string.format("%s displays \"%s\" subzero false", self.lunarPath, lunarName),
+        string.format("%s displays \"%s\" gamma reset", self.lunarPath, lunarName),
+        string.format("%s displays \"%s\" brightness 50", self.lunarPath, lunarName)
+    }
+    
+    for _, cmd in ipairs(resetCommands) do
+        log("Executing failsafe command: " .. cmd)
+        local success, result = pcall(hs.execute, cmd)
+        if not success then
+            log(string.format("Failsafe command failed: %s", result), true)
+        end
+        hs.timer.usleep(200000)
+    end
+
+    self.state.failedRestoreAttempts = 0
+end
+
+function obj:emergencyReset()
+    local now = hs.timer.secondsSinceEpoch()
+    
+    -- Prevent restarts more frequent than every 30 seconds
+    if (now - self.state.lastLunarRestart) < 30 then
+        log("Skipping Lunar restart - too soon since last restart", true)
+        hs.alert.show("⚠️ Lunar restart skipped (cooling down)", 2)
+        return
+    end
+    
+    log("Performing emergency Lunar reset", true)
+    hs.alert.show("🚨 Emergency Lunar reset in progress...", 3)
+    
+    -- Kill Lunar
+    hs.execute("killall Lunar")
+    
+    -- Update last restart time
+    self.state.lastLunarRestart = now
+    
+    -- Wait and restart
+    hs.timer.doAfter(2, function()
+        hs.execute("open -a Lunar")
+        -- Clear our display cache
+        self:clearDisplayCache()
+        hs.alert.show("🌙 Lunar restarted", 3)
+    end)
 end
 
 -- Initialize ScreenDimmer
@@ -358,6 +477,8 @@ function obj:init()
         lastUnlockEventTime = 0,
         lastHotkeyTime = 0,
         lastRestoreTime = 0,
+        failedRestoreAttempts = 0,
+        lastLunarRestart = 0,
         screenWatcher = nil,
         unlockTimer = nil
     }
@@ -411,6 +532,10 @@ function obj:init()
         
         return false
     end)
+
+    if not self.userActionWatcher then
+        log("Failed to create eventtap. Please check Accessibility permissions.", true)
+    end
 
     -- Setup caffeine watcher
     self.caffeineWatcher = hs.caffeinate.watcher.new(function(eventType)
@@ -565,18 +690,32 @@ function obj:start(showAlert)
     local retryCount = 0
     
     local function startWatcher()
-        if self.userActionWatcher then
-            local success = self.userActionWatcher:start()
-            if not success then
-                retryCount = retryCount + 1
-                if retryCount <= maxRetries then
-                    log(string.format("Retry %d/%d: Failed to start eventtap, retrying in %d seconds...", 
-                        retryCount, maxRetries, retryDelay))
-                    hs.timer.doAfter(retryDelay, startWatcher)
-                else
-                    log("Failed to start eventtap after all retries. Please check Accessibility permissions.", true)
-                end
+        if not self.userActionWatcher then
+            retryCount = retryCount + 1
+            if retryCount <= maxRetries then
+                log(string.format("Retry %d/%d: Eventtap not available, retrying creation in %d seconds...", 
+                    retryCount, maxRetries, retryDelay))
+                
+                -- Try to recreate the eventtap
+                self.userActionWatcher = hs.eventtap.new({
+                    hs.eventtap.event.types.keyDown,
+                    hs.eventtap.event.types.flagsChanged,
+                    hs.eventtap.event.types.leftMouseDown,
+                    hs.eventtap.event.types.rightMouseDown,
+                    hs.eventtap.event.types.mouseMoved
+                }, function(event)
+                    -- ... event handling code ...
+                end)
+                
+                hs.timer.doAfter(retryDelay, startWatcher)
+            else
+                log("Failed to create eventtap after all retries. Please check Accessibility permissions.", true)
+                hs.alert.show("⚠️ Failed to start user activity monitoring\nPlease check Accessibility permissions", 5)
             end
+        else
+            -- If we have a valid eventtap object, start it
+            self.userActionWatcher:start()
+            log("User activity watcher started successfully")
         end
     end
     
@@ -585,9 +724,6 @@ function obj:start(showAlert)
     -- Start all other watchers
     if self.stateChecker then
         self.stateChecker:start()
-    end
-    if self.userActionWatcher then
-        self.userActionWatcher:start()
     end
     if self.caffeineWatcher then
         self.caffeineWatcher:start()
@@ -685,10 +821,18 @@ function obj:toggleDim()
 end
 
 -- Bind hotkeys
+-- In your bindHotkeys function:
 function obj:bindHotkeys(mapping)
     local spec = {
         toggle = function() self:toggle() end,
-        dim = function() self:toggleDim() end
+        dim = function() self:toggleDim() end,
+        reset = function() 
+            -- Force reset all displays
+            local lunarDisplays = self:getLunarDisplayNames()
+            for _, lunarName in pairs(lunarDisplays) do
+                self:resetDisplayState(lunarName)
+            end
+        end
     }
     hs.spoons.bindHotkeysToSpec(spec, mapping)
 end
