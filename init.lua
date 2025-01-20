@@ -17,7 +17,7 @@ local obj = {
 
         -- Target brightness level (-100 to 100)
         -- Negative values use subzero (gamma mode)
-        -- Positive values use regular brightness
+        -- Positive values use regular (hardware) brightness
         dimLevel = 10,
 
         -- Internal display ± gain level (added to dimLevel)
