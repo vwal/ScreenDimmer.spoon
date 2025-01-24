@@ -136,8 +136,8 @@ function obj:sortScreensByPriority(screens)
     return prioritizedScreens
 end
 
--- Get brightness for a screen
-function obj:getBrightness(screen)
+-- Get hardware brightness (without subzero/gamma effects)
+function obj:getHardwareBrightness(screen)
     local screenName = screen:name()
     local lunarDisplays = self:getLunarDisplayNames()
     local lunarName = lunarDisplays[screenName]
@@ -147,31 +147,26 @@ function obj:getBrightness(screen)
         return nil
     end
 
-    local command = string.format("%s displays \"%s\" brightness", self.lunarPath, lunarName)
-
-
-    local success, output, status = pcall(hs.execute, command)
-    if not success then
-        log(string.format("Error executing Lunar command: %s", status), true)
-        return false
-    end
-
-    log(string.format("Raw brightness command output for '%s':", screenName))
-    log(output or "nil")
-    log("Command status: " .. tostring(status))
-    log("Command executed: " .. command)
-
-    if status then
-        local brightness = output:match("brightness:%s*(%d+)")
-        if brightness then
-            local value = tonumber(brightness)
-            log(string.format("Parsed brightness value: %d", value))
-            return value
-        end
-    end
+    -- First ensure subzero is disabled temporarily
+    local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
+        self.lunarPath, lunarName)
+    pcall(hs.execute, cmdDisableSubzero)
     
-    log(string.format("Failed to get brightness for screen '%s'", screenName))
-    return nil
+    -- Small delay to let changes take effect
+    hs.timer.usleep(200000)  -- 0.2 seconds
+    
+    -- Now get the actual hardware brightness
+    local command = string.format("%s displays \"%s\" brightness --read", 
+        self.lunarPath, lunarName)
+    
+    local success, output, status = pcall(hs.execute, command)
+    if not success or not status then
+        log(string.format("Error reading hardware brightness: %s", output), true)
+        return nil
+    end
+
+    local brightness = output:match("brightness:%s*(%d+)")
+    return brightness and tonumber(brightness)
 end
 
 -- Set brightness for a screen
@@ -220,6 +215,72 @@ function obj:setBrightness(screen, targetValue)
     end
 end
 
+-- Get current subzero dimming level
+function obj:getSubzeroDimming(screen)
+    local screenName = screen:name()
+    local lunarDisplays = self:getLunarDisplayNames()
+    local lunarName = lunarDisplays[screenName]
+    
+    if not lunarName then
+        log(string.format("Display '%s' not found in Lunar display list", screenName), true)
+        return nil
+    end
+
+    local command = string.format("%s displays \"%s\" subzeroDimming", 
+        self.lunarPath, lunarName)
+    
+    local success, output, status = pcall(hs.execute, command)
+    if not success or not status then
+        log(string.format("Error reading subzero dimming: %s", output), true)
+        return nil
+    end
+
+    -- The output should be a decimal between 0 and 1
+    -- Convert it to our -100 to 0 scale
+    local dimming = output:match("subzeroDimming:%s*([%d%.]+)")
+    if dimming then
+        local value = tonumber(dimming)
+        -- Convert from 0-1 range to our -100-0 range
+        return math.floor((value * 100) - 100)
+    end
+    return nil
+end
+
+-- Set subzero dimming level
+function obj:setSubzeroDimming(screen, level)
+    local screenName = screen:name()
+    local lunarDisplays = self:getLunarDisplayNames()
+    local lunarName = lunarDisplays[screenName]
+    
+    if not lunarName then return false end
+    
+    -- Enable subzero mode
+    local cmdEnableSubzero = string.format("%s displays \"%s\" subzero true", 
+        self.lunarPath, lunarName)
+    pcall(hs.execute, cmdEnableSubzero)
+    
+    -- Set dimming level (convert from -100..0 to 0..1 range)
+    local dimming = (100 + level) / 100  -- level is negative
+    local cmdSetDimming = string.format("%s displays \"%s\" subzeroDimming %.2f", 
+        self.lunarPath, lunarName, dimming)
+    
+    local success = pcall(hs.execute, cmdSetDimming)
+    return success
+end
+
+-- Disable subzero dimming
+function obj:disableSubzero(screen)
+    local screenName = screen:name()
+    local lunarDisplays = self:getLunarDisplayNames()
+    local lunarName = lunarDisplays[screenName]
+    
+    if not lunarName then return false end
+    
+    local cmd = string.format("%s displays \"%s\" subzero false", 
+        self.lunarPath, lunarName)
+    return pcall(hs.execute, cmd)
+end
+
 -- Clear the cache when needed
 function obj:clearDisplayCache()
     self.displayMappings = nil
@@ -239,33 +300,142 @@ function obj:dimScreens()
         return
     end
 
-    -- Store current brightness levels
-    self.state.originalBrightness = {}
+    -- Show priority order in log
+    log("Display priority order:")
+    for i, screen in ipairs(screens) do
+        log(string.format("  %d. %s (priority: %d)", 
+            i, screen:name(), self.config.displayPriorities[screen:name()] or 999))
+    end
+
+    -- Pre-calculate dim levels and determine transition strategy
+    local screenSettings = {}
     for _, screen in ipairs(screens) do
-        local currentBrightness = self:getBrightness(screen)
-        if currentBrightness then
-            self.state.originalBrightness[screen:name()] = currentBrightness
+        local screenName = screen:name()
+        local baseLevel = self.config.dimLevel
+        local finalLevel = baseLevel
+        local needsTransitionStrategy = false
+        
+        if screenName:match("Built%-in") then
+            finalLevel = baseLevel + (self.config.internalDisplayGainLevel or 0)
+            finalLevel = math.max(-100, math.min(100, finalLevel))
             
-            -- Calculate dim level with gain for internal display
-            local dimLevel = self.config.dimLevel
-            if screen:name():match("Built%-in") then
-                dimLevel = dimLevel + (self.config.internalDisplayGainLevel or 0)
-                -- Ensure we stay within valid range
-                dimLevel = math.max(-100, math.min(100, dimLevel))
-                if self.config.logging then
-                    log(string.format("Applying internal display gain: final dim level = %d", dimLevel))
+            -- Determine if we need special transition handling
+            -- (when crossing from negative to less negative)
+            if baseLevel < 0 and finalLevel < 0 and finalLevel > baseLevel then
+                needsTransitionStrategy = true
+            end
+            
+            if self.config.logging then
+                log(string.format("Pre-calculated internal display: base=%d, final=%d, needs transition=%s", 
+                    baseLevel, finalLevel, tostring(needsTransitionStrategy)))
+            end
+        end
+        
+        screenSettings[screenName] = {
+            finalLevel = finalLevel,
+            needsTransitionStrategy = needsTransitionStrategy
+        }
+    end
+
+    self.state.originalBrightness = {}
+    self.state.originalSubzero = {}
+    
+    for _, screen in ipairs(screens) do
+        local screenName = screen:name()
+        local settings = screenSettings[screenName]
+        local finalLevel = settings.finalLevel
+        local needsTransitionStrategy = settings.needsTransitionStrategy
+        
+        -- First get the subzero state while it's still in original state
+        local currentSubzero = self:getSubzeroDimming(screen)
+        -- Then get hardware brightness
+        local currentBrightness = self:getHardwareBrightness(screen)
+        
+        if currentBrightness then
+            self.state.originalBrightness[screenName] = currentBrightness
+            self.state.originalSubzero[screenName] = currentSubzero
+            
+            log(string.format("Stored original state for %s: brightness=%d, subzero=%s", 
+                screenName, currentBrightness, tostring(currentSubzero)))
+            
+            -- Don't dim if target is brighter than current
+            if finalLevel >= currentBrightness then
+                log(string.format("Skipping dim for %s - target %d >= current %d", 
+                    screenName, finalLevel, currentBrightness))
+                goto continue
+            end
+            
+            local lunarDisplays = self:getLunarDisplayNames()
+            local lunarName = lunarDisplays[screenName]
+            
+            if needsTransitionStrategy then
+                -- For transitions that might cause the "dip", go directly to final state
+                if finalLevel < 0 then
+                    -- Set subzero directly to final value
+                    self:setSubzeroDimming(screen, finalLevel)
+                else
+                    -- Disable subzero and set brightness in one quick sequence
+                    self:disableSubzero(screen)
+                    hs.timer.usleep(100000)  -- Quick 0.1s delay
+                    if lunarName then
+                        local cmd = string.format("%s displays \"%s\" brightness %d", 
+                            self.lunarPath, lunarName, finalLevel)
+                        pcall(hs.execute, cmd)
+                    end
+                end
+            else
+                -- For other cases, use normal transition
+                if finalLevel < 0 then
+                    self:setSubzeroDimming(screen, finalLevel)
+                else
+                    self:disableSubzero(screen)
+                    hs.timer.usleep(200000)  -- Normal 0.2s delay
+                    if lunarName then
+                        local cmd = string.format("%s displays \"%s\" brightness %d", 
+                            self.lunarPath, lunarName, finalLevel)
+                        pcall(hs.execute, cmd)
+                    end
                 end
             end
             
-            -- Apply dim level (can be negative for subzero mode)
-            self:setBrightness(screen, dimLevel)
+            ::continue::
         end
     end
     
-    self.state.isDimmed = true
-    self.state.dimmedBeforeSleep = true
-    self.state.failedRestoreAttempts = 0
-    log("Screens dimmed")
+    -- Create a verification tracker
+    local screensToVerify = #screens
+    local verificationsPassed = 0
+
+    -- Verify each screen independently
+    for _, screen in ipairs(screens) do
+        hs.timer.doAfter(0.5, function()
+            local screenName = screen:name()
+            local targetLevel = screenSettings[screenName].finalLevel
+            local currentBrightness
+            
+            if targetLevel < 0 then
+                currentBrightness = self:getSubzeroDimming(screen)
+            else
+                currentBrightness = self:getHardwareBrightness(screen)
+            end
+            
+            -- Check if brightness is within acceptable range
+            if currentBrightness and math.abs(currentBrightness - targetLevel) <= 5 then
+                verificationsPassed = verificationsPassed + 1
+                
+                -- If all screens verified, update state
+                if verificationsPassed == screensToVerify then
+                    self.state.isDimmed = true
+                    self.state.dimmedBeforeSleep = true
+                    self.state.failedRestoreAttempts = 0
+                    log("Screens dimmed")
+                end
+            else
+                log(string.format("Verification failed for %s: target=%d, current=%s", 
+                    screenName, targetLevel, tostring(currentBrightness)), true)
+            end
+        end)
+    end
 end
 
 -- Restore brightness function
@@ -297,52 +467,38 @@ function obj:restoreBrightness()
         local lunarDisplays = self:getLunarDisplayNames()
         local lunarName = lunarDisplays[screenName]
         local originalBrightness = self.state.originalBrightness[screenName]
+        local originalSubzero = self.state.originalSubzero[screenName]
         
         if originalBrightness and lunarName then
-            log(string.format("Restoring brightness for '%s' (lunar name: '%s') to %d", 
-                screenName, lunarName, originalBrightness))
+            log(string.format("Restoring state for '%s': brightness=%d, subzero=%s", 
+                screenName, originalBrightness, tostring(originalSubzero)))
 
-            -- First explicitly disable subzero mode
-            local cmdReset = string.format("%s displays \"%s\" subzero false", 
-                self.lunarPath, lunarName)
-            
-            log("Executing reset: " .. cmdReset)
-            local success, result = pcall(hs.execute, cmdReset)
-            if not success then
-                log(string.format("Error resetting subzero mode: %s", result), true)
-                -- Try failsafe reset
-                self:resetDisplayState(lunarName)
+            -- First restore any subzero state if it existed
+            if originalSubzero and originalSubzero < 0 then
+                self:setSubzeroDimming(screen, originalSubzero)
+            else
+                self:disableSubzero(screen)
             end
-
-            -- Small delay after reset
+            
+            -- Small delay after subzero changes
             hs.timer.usleep(300000)  -- 0.3 seconds
 
-            -- Then set the target brightness
+            -- Then restore hardware brightness
             local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
                 self.lunarPath, lunarName, originalBrightness)
             
             log("Executing: " .. cmdBrightness)
-            success, result = pcall(hs.execute, cmdBrightness)
+            local success, result = pcall(hs.execute, cmdBrightness)
             if not success then
                 log(string.format("Error setting brightness: %s", result), true)
-                -- Try failsafe reset
                 self:resetDisplayState(lunarName)
             end
 
             -- Verify the changes took effect
             hs.timer.doAfter(0.5, function()
-                local currentBrightness = self:getBrightness(screen)
+                local currentBrightness = self:getHardwareBrightness(screen)
                 if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
                     log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
-                    self:resetDisplayState(lunarName)
-                end
-            end)
-
-            hs.timer.doAfter(0.5, function()
-                local currentBrightness = self:getBrightness(screen)
-                if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
-                    log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
-                    self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
                     self:resetDisplayState(lunarName)
                 end
             end)
@@ -356,21 +512,20 @@ function obj:restoreBrightness()
     self.state.isDimmed = false
     self.state.dimmedBeforeLock = false
     self.state.dimmedBeforeSleep = false
-    self.state.originalBrightness = {}
     
     -- Create a verification tracker
     local screensToVerify = #screens
     local verificationsPassed = 0
     
-    -- Verify each screen's brightness
+    -- Final verification pass
     for _, screen in ipairs(screens) do
         local screenName = screen:name()
         local originalBrightness = self.state.originalBrightness[screenName]
         
         hs.timer.doAfter(0.5, function()
-            local currentBrightness = self:getBrightness(screen)
+            local currentBrightness = self:getHardwareBrightness(screen)
             if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
-                log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
+                log(string.format("Final brightness verification failed for %s. Attempting recovery...", screenName), true)
                 self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
                 self:resetDisplayState(lunarName)
             else
@@ -380,6 +535,9 @@ function obj:restoreBrightness()
                 if verificationsPassed == screensToVerify then
                     log("All screens verified successfully, resetting failure counter")
                     self.state.failedRestoreAttempts = 0
+                    -- Only clear state storage after successful verification
+                    self.state.originalBrightness = {}
+                    self.state.originalSubzero = {}
                 end
             end
         end)
