@@ -205,7 +205,7 @@ function obj:setBrightness(screen, targetValue)
     
     if not lunarName then
         log(string.format("Display '%s' not found in Lunar display list", screenName), true)
-        return
+        return false
     end
 
     if targetValue < 0 then
@@ -222,25 +222,37 @@ function obj:setBrightness(screen, targetValue)
         log(string.format("Set subzero brightness for '%s': %.2f", 
             screenName, (100 + targetValue) / 100))
     else
-        -- For regular brightness, disable subzero and set brightness
-        local commands = {
-            string.format("%s displays \"%s\" subzero false", 
-                self.lunarPath, lunarName),
-            string.format("%s displays \"%s\" brightness %d", 
-                self.lunarPath, lunarName, targetValue)
-        }
-        
-        for _, cmd in ipairs(commands) do
-            local success, result = pcall(hs.execute, cmd)
+        -- For positive values, only disable subzero if currently negative
+        local currentSubzero = self:getSubzeroDimming(screen)
+        if currentSubzero and currentSubzero < 0 then
+            local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
+                self.lunarPath, lunarName)
+            
+            local success, result = pcall(hs.execute, cmdDisableSubzero)
             if not success then
-                log(string.format("Error executing Lunar command: %s", result), true)
+                log(string.format("Error disabling subzero: %s", result), true)
                 return false
             end
+            
+            -- Short wait only if we toggled subzero
+            hs.timer.usleep(200000)
+        end
+        
+        -- Set brightness
+        local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
+            self.lunarPath, lunarName, targetValue)
+        
+        local success, result = pcall(hs.execute, cmdBrightness)
+        if not success then
+            log(string.format("Error setting brightness: %s", result), true)
+            return false
         end
         
         log(string.format("Set regular brightness for '%s': %d", 
             screenName, targetValue))
     end
+    
+    return true
 end
 
 -- Get current subzero dimming level
@@ -316,7 +328,7 @@ end
 
 -- Dim screens function
 function obj:dimScreens()
-    -- Bail out if already dimmed or not enabled
+    -- Bail out checks
     if self.state.isDimmed or not self.state.isEnabled then
         log("dimScreens called but already dimmed or not enabled")
         return
@@ -330,21 +342,23 @@ function obj:dimScreens()
         return
     end
 
-    -- Show priority order in log
+    -- Show priority order
     log("Display priority order:")
     for i, screen in ipairs(screens) do
         log(string.format("  %d. %s (priority: %d)", 
             i, screen:name(), self.config.displayPriorities[screen:name()] or 999))
     end
 
-    -- Clear old state
+    -- Pre-compute final levels and store original states
+    local finalLevels = {}
     self.state.originalBrightness = {}
     self.state.originalSubzero = {}
 
-    -- Process each screen
+    -- First pass: compute and store states
     for _, screen in ipairs(screens) do
         local screenName = screen:name()
         local lunarName = self:getLunarDisplayNames()[screenName]
+        
         if not lunarName then
             log("Cannot find Lunar name for " .. screenName)
             goto continue
@@ -353,28 +367,41 @@ function obj:dimScreens()
         -- Store original state
         local currentSubzero = self:getSubzeroDimming(screen)
         local currentBrightness = self:getHardwareBrightness(screen)
+        
         if not currentBrightness then
             log(string.format("Could not get current brightness for %s", screenName))
             goto continue
         end
 
-        self.state.originalBrightness[screenName] = currentBrightness
-        self.state.originalSubzero[screenName] = currentSubzero
-        log(string.format("Stored original for %s => br=%d, subz=%s", 
-            screenName, currentBrightness, tostring(currentSubzero)))
-
         -- Calculate final dim level
         local finalLevel = self.config.dimLevel
-        -- Special handling for 0: treat it as -1 (minimal gamma dimming)
-        if finalLevel == 0 then
-            finalLevel = -1
-        end
+        if finalLevel == 0 then finalLevel = -1 end
         
         if screenName:match("Built%-in") then
             finalLevel = finalLevel + (self.config.internalDisplayGainLevel or 0)
             finalLevel = math.max(-100, math.min(100, finalLevel))
         end
 
+        -- Store all computed values
+        self.state.originalBrightness[screenName] = currentBrightness
+        self.state.originalSubzero[screenName] = currentSubzero
+        finalLevels[screenName] = finalLevel
+
+        log(string.format("Stored original for %s => br=%d, subz=%s, target=%d", 
+            screenName, currentBrightness, tostring(currentSubzero), finalLevel))
+
+        ::continue::
+    end
+
+    -- Second pass: apply dim settings
+    for _, screen in ipairs(screens) do
+        local screenName = screen:name()
+        local finalLevel = finalLevels[screenName]
+        
+        if not finalLevel then goto continue end
+
+        local currentBrightness = self.state.originalBrightness[screenName]
+        
         -- Skip if target is brighter than current
         if finalLevel >= currentBrightness then
             log(string.format("Skipping dim on %s (finalLevel=%d >= current=%d)",
@@ -383,41 +410,23 @@ function obj:dimScreens()
         end
 
         -- Apply the dim settings
-        if finalLevel < 0 then
-            -- Set subzero dimming
-            self:setSubzeroDimming(screen, finalLevel)
-        else
-            -- Only disable subzero if it's actually negative
-            if currentSubzero and currentSubzero < 0 then
-                local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
-                    self.lunarPath, lunarName)
-                pcall(hs.execute, cmdDisableSubzero)
-                hs.timer.usleep(200000)  -- short wait only if we toggled subzero
-            end
-
-            -- Set hardware brightness
-            local cmd = string.format("%s displays \"%s\" brightness %d", 
-                self.lunarPath, lunarName, finalLevel)
-            pcall(hs.execute, cmd)
+        if not self:setBrightness(screen, finalLevel) then
+            log(string.format("Failed to set brightness for %s", screenName), true)
         end
 
         ::continue::
     end
 
-    -- Single verification pass after delay
+    -- Verification pass after delay
     hs.timer.doAfter(0.5, function()
         local verificationsPassed = 0
         local internalDisplayVerified = false
         
         for _, screen in ipairs(screens) do
             local screenName = screen:name()
-            local finalLevel = self.config.dimLevel
-            if finalLevel == 0 then finalLevel = -1 end
+            local finalLevel = finalLevels[screenName]
             
-            if screenName:match("Built%-in") then
-                finalLevel = finalLevel + (self.config.internalDisplayGainLevel or 0)
-                finalLevel = math.max(-100, math.min(100, finalLevel))
-            end
+            if not finalLevel then goto continue end
 
             local current
             if finalLevel < 0 then
@@ -426,52 +435,55 @@ function obj:dimScreens()
                 current = self:getHardwareBrightness(screen)
             end
 
-            -- Use tighter tolerance for very low brightness values
             local tolerance = (finalLevel <= 1) and 1 or 5
             
-            if current and math.abs(current - finalLevel) <= tolerance then
-                verificationsPassed = verificationsPassed + 1
-                if screenName:match("Built%-in") then
-                    internalDisplayVerified = true
+            local function verifyAndLog(attempt)
+                if current and math.abs(current - finalLevel) <= tolerance then
+                    verificationsPassed = verificationsPassed + 1
+                    if screenName:match("Built%-in") then
+                        internalDisplayVerified = true
+                    end
+                    log(string.format("%s verification passed for %s", 
+                        attempt, screenName))
+                    return true
                 end
-                log(string.format("Verification passed for %s", screenName))
-            else
+                return false
+            end
+
+            if not verifyAndLog("First") then
                 -- For very low brightness, try one more time
                 if finalLevel <= 1 then
-                    log(string.format("First verification failed for low brightness, retrying %s", screenName))
+                    log(string.format(
+                        "First verification failed for low brightness, retrying %s", 
+                        screenName))
                     
-                    local lunarName = self:getLunarDisplayNames()[screenName]
-                    if lunarName then
-                        -- Retry the brightness setting
-                        local cmd = string.format("%s displays \"%s\" brightness %d", 
-                            self.lunarPath, lunarName, finalLevel)
-                        pcall(hs.execute, cmd)
-                        
-                        -- Second verification after delay
-                        hs.timer.doAfter(1.0, function()
-                            if finalLevel < 0 then
-                                current = self:getSubzeroDimming(screen)
-                            else
-                                current = self:getHardwareBrightness(screen)
-                            end
-                            
-                            if current and math.abs(current - finalLevel) <= tolerance then
-                                verificationsPassed = verificationsPassed + 1
-                                if screenName:match("Built%-in") then
-                                    internalDisplayVerified = true
-                                end
-                                log(string.format("Second verification passed for %s", screenName))
-                            else
-                                log(string.format("Both verifications failed for %s: target=%d, current=%s", 
-                                    screenName, finalLevel, tostring(current)), true)
-                            end
-                        end)
+                    -- Retry the brightness setting
+                    if not self:setBrightness(screen, finalLevel) then
+                        log(string.format("Retry failed for %s", screenName), true)
                     end
+                    
+                    -- Second verification after delay
+                    hs.timer.doAfter(1.0, function()
+                        if finalLevel < 0 then
+                            current = self:getSubzeroDimming(screen)
+                        else
+                            current = self:getHardwareBrightness(screen)
+                        end
+                        
+                        if not verifyAndLog("Second") then
+                            log(string.format(
+                                "Both verifications failed for %s: target=%d, current=%s", 
+                                screenName, finalLevel, tostring(current)), true)
+                        end
+                    end)
                 else
-                    log(string.format("Verification failed for %s: target=%d, current=%s", 
+                    log(string.format(
+                        "Verification failed for %s: target=%d, current=%s", 
                         screenName, finalLevel, tostring(current)), true)
                 end
             end
+
+            ::continue::
         end
 
         -- Update overall state
@@ -481,7 +493,8 @@ function obj:dimScreens()
             self.state.failedRestoreAttempts = 0
             
             if verificationsPassed < #screens then
-                log(string.format("Partial dim success: %d/%d screens (internal verified)", 
+                log(string.format(
+                    "Partial dim success: %d/%d screens (internal verified)", 
                     verificationsPassed, #screens))
             else
                 log("All screens dimmed successfully")
