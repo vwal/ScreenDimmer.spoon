@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.6",
+    version = "4.61",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -79,16 +79,23 @@ end
 function obj:getLunarDisplayNames()
     -- Return cached mappings if available
     if self.displayMappings then
+        log("Returning cached display mappings:")
+        for k, v in pairs(self.displayMappings) do
+            log(string.format("  Cached mapping: %s -> %s", k, v))
+        end
         return self.displayMappings
     end
    
     local command = string.format("%s displays", self.lunarPath)
+    log("Executing Lunar command: " .. command)
     local output, status = hs.execute(command)
     
     if not status then
         log("Failed to get display list from Lunar", true)
         return {}
     end
+
+    log("Raw Lunar output:\n" .. output)
 
     local displays = {}
     for line in output:gmatch("[^\r\n]+") do
@@ -99,11 +106,18 @@ function obj:getLunarDisplayNames()
                 displays["Built-in Retina Display"] = "Built-in"
             end
             log(string.format("Added display mapping: %s -> %s", name, displays[name]))
+        else
+            log(string.format("Failed to parse line: %s", line))
         end
     end
     
     -- Cache the mappings
     self.displayMappings = displays
+    log("Cached new display mappings:")
+    for k, v in pairs(displays) do
+        log(string.format("  New mapping: %s -> %s", k, v))
+    end
+    
     return displays
 end
 
@@ -550,6 +564,8 @@ function obj:restoreBrightness()
     -- Final verification pass
     for _, screen in ipairs(screens) do
         local screenName = screen:name()
+        local lunarDisplays = self:getLunarDisplayNames()  -- Add this line
+        local lunarName = lunarDisplays[screenName]        -- Add this line
         local originalBrightness = self.state.originalBrightness[screenName]
         
         hs.timer.doAfter(0.5, function()
@@ -557,7 +573,12 @@ function obj:restoreBrightness()
             if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
                 log(string.format("Final brightness verification failed for %s. Attempting recovery...", screenName), true)
                 self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
-                self:resetDisplayState(lunarName)
+                -- Only call resetDisplayState if we have a valid lunarName
+                if lunarName then
+                    self:resetDisplayState(lunarName)
+                else
+                    log(string.format("Could not find Lunar name for display: %s", screenName), true)
+                end
             else
                 verificationsPassed = verificationsPassed + 1
                 
