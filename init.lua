@@ -98,16 +98,26 @@ function obj:getLunarDisplayNames()
     log("Raw Lunar output:\n" .. output)
 
     local displays = {}
+    local currentDisplay = nil
     for line in output:gmatch("[^\r\n]+") do
-        local num, name = line:match("^(%d+):%s+(.+)$")
+        -- Match the display header line (e.g., "0: Built-in")
+        local num, name = line:match("^(%d+):%s+([^%s]+)$")
+        -- Or match the EDID Name line
+        local edidName = line:match("^%s*EDID Name:%s+([^%s]+)$")
+        
         if num and name then
+            currentDisplay = name
             displays[name] = name  -- Direct mapping
             if name == "Built-in" then
                 displays["Built-in Retina Display"] = "Built-in"
             end
             log(string.format("Added display mapping: %s -> %s", name, displays[name]))
-        else
-            log(string.format("Failed to parse line: %s", line))
+        elseif edidName and currentDisplay then
+            -- Additional mapping using EDID name if different
+            if edidName ~= currentDisplay then
+                displays[edidName] = currentDisplay
+                log(string.format("Added EDID mapping: %s -> %s", edidName, currentDisplay))
+            end
         end
     end
     
