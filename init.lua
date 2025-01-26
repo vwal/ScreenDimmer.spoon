@@ -369,32 +369,30 @@ function obj:dimScreens()
             local lunarName = lunarDisplays[screenName]
             
             if needsTransitionStrategy then
-                -- For transitions that might cause the "dip", go directly to final state
                 if finalLevel < 0 then
-                    -- Set subzero directly to final value
                     self:setSubzeroDimming(screen, finalLevel)
                 else
-                    -- Disable subzero and set brightness in one quick sequence
                     self:disableSubzero(screen)
-                    hs.timer.usleep(100000)  -- Quick 0.1s delay
-                    if lunarName then
-                        local cmd = string.format("%s displays \"%s\" brightness %d", 
-                            self.lunarPath, lunarName, finalLevel)
-                        pcall(hs.execute, cmd)
-                    end
+                    hs.timer.doAfter(0.1, function()
+                        if lunarName then
+                            local cmd = string.format("%s displays \"%s\" brightness %d", 
+                                self.lunarPath, lunarName, finalLevel)
+                            pcall(hs.execute, cmd)
+                        end
+                    end)
                 end
             else
-                -- For other cases, use normal transition
                 if finalLevel < 0 then
                     self:setSubzeroDimming(screen, finalLevel)
                 else
                     self:disableSubzero(screen)
-                    hs.timer.usleep(200000)  -- Normal 0.2s delay
-                    if lunarName then
-                        local cmd = string.format("%s displays \"%s\" brightness %d", 
-                            self.lunarPath, lunarName, finalLevel)
-                        pcall(hs.execute, cmd)
-                    end
+                    hs.timer.doAfter(0.2, function()
+                        if lunarName then
+                            local cmd = string.format("%s displays \"%s\" brightness %d", 
+                                self.lunarPath, lunarName, finalLevel)
+                            pcall(hs.execute, cmd)
+                        end
+                    end)
                 end
             end
             
@@ -405,6 +403,7 @@ function obj:dimScreens()
     -- Create a verification tracker
     local screensToVerify = #screens
     local verificationsPassed = 0
+    local internalDisplayVerified = false
 
     -- Verify each screen independently
     for _, screen in ipairs(screens) do
@@ -423,16 +422,30 @@ function obj:dimScreens()
             if currentBrightness and math.abs(currentBrightness - targetLevel) <= 5 then
                 verificationsPassed = verificationsPassed + 1
                 
-                -- If all screens verified, update state
-                if verificationsPassed == screensToVerify then
-                    self.state.isDimmed = true
-                    self.state.dimmedBeforeSleep = true
-                    self.state.failedRestoreAttempts = 0
-                    log("Screens dimmed")
+                -- Track if internal display was verified successfully
+                if screenName:match("Built%-in") then
+                    internalDisplayVerified = true
                 end
+                
+                log(string.format("Verification passed for %s", screenName))
             else
                 log(string.format("Verification failed for %s: target=%d, current=%s", 
                     screenName, targetLevel, tostring(currentBrightness)), true)
+            end
+            
+            -- Consider dimming successful if internal display is dimmed
+            if internalDisplayVerified then
+                self.state.isDimmed = true
+                self.state.dimmedBeforeSleep = true
+                self.state.failedRestoreAttempts = 0
+                
+                -- Log partial success if some external displays failed
+                if verificationsPassed < screensToVerify then
+                    log(string.format("Partial dim success: %d/%d screens (internal display verified)", 
+                        verificationsPassed, screensToVerify))
+                else
+                    log("All screens dimmed successfully")
+                end
             end
         end)
     end
@@ -462,51 +475,68 @@ function obj:restoreBrightness()
     self.state.isRestoring = true
     
     local screens = self:sortScreensByPriority(hs.screen.allScreens())
-    for _, screen in ipairs(screens) do
-        local screenName = screen:name()
-        local lunarDisplays = self:getLunarDisplayNames()
-        local lunarName = lunarDisplays[screenName]
-        local originalBrightness = self.state.originalBrightness[screenName]
-        local originalSubzero = self.state.originalSubzero[screenName]
-        
-        if originalBrightness and lunarName then
-            log(string.format("Restoring state for '%s': brightness=%d, subzero=%s", 
-                screenName, originalBrightness, tostring(originalSubzero)))
 
-            -- First restore any subzero state if it existed
-            if originalSubzero and originalSubzero < 0 then
-                self:setSubzeroDimming(screen, originalSubzero)
-            else
-                self:disableSubzero(screen)
+    function obj:restoreScreens()
+        -- Process screens one at a time
+        local function processScreen(index)
+            if index > #screens then
+                -- All screens processed
+                return
             end
             
-            -- Small delay after subzero changes
-            hs.timer.usleep(300000)  -- 0.3 seconds
-
-            -- Then restore hardware brightness
-            local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
-                self.lunarPath, lunarName, originalBrightness)
+            local screen = screens[index]
+            local screenName = screen:name()
+            local lunarDisplays = self:getLunarDisplayNames()
+            local lunarName = lunarDisplays[screenName]
+            local originalBrightness = self.state.originalBrightness[screenName]
+            local originalSubzero = self.state.originalSubzero[screenName]
             
-            log("Executing: " .. cmdBrightness)
-            local success, result = pcall(hs.execute, cmdBrightness)
-            if not success then
-                log(string.format("Error setting brightness: %s", result), true)
-                self:resetDisplayState(lunarName)
-            end
-
-            -- Verify the changes took effect
-            hs.timer.doAfter(0.5, function()
-                local currentBrightness = self:getHardwareBrightness(screen)
-                if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
-                    log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
-                    self:resetDisplayState(lunarName)
+            if originalBrightness and lunarName then
+                log(string.format("Restoring state for '%s': brightness=%d, subzero=%s", 
+                    screenName, originalBrightness, tostring(originalSubzero)))
+    
+                -- First restore any subzero state if it existed
+                if originalSubzero and originalSubzero < 0 then
+                    self:setSubzeroDimming(screen, originalSubzero)
+                else
+                    self:disableSubzero(screen)
                 end
-            end)
-
-            -- Wait between screens if there are multiple
-            hs.timer.usleep(300000)  -- 0.3 seconds
+                
+                hs.timer.doAfter(0.3, function()
+                    -- Then restore hardware brightness
+                    local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
+                        self.lunarPath, lunarName, originalBrightness)
+                    
+                    log("Executing: " .. cmdBrightness)
+                    local success, result = pcall(hs.execute, cmdBrightness)
+                    if not success then
+                        log(string.format("Error setting brightness: %s", result), true)
+                        self:resetDisplayState(lunarName)
+                    end
+    
+                    -- Verify the changes took effect
+                    hs.timer.doAfter(0.5, function()
+                        local currentBrightness = self:getHardwareBrightness(screen)
+                        if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
+                            log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
+                            self:resetDisplayState(lunarName)
+                        end
+                        
+                        -- Process next screen after a delay
+                        hs.timer.doAfter(0.3, function()
+                            processScreen(index + 1)
+                        end)
+                    end)
+                end)
+            else
+                -- If screen was skipped, move to next one immediately
+                processScreen(index + 1)
+            end
         end
-    end
+        
+        -- Start processing with first screen
+        processScreen(1)
+    end    
 
     -- Reset most state immediately
     self.state.isDimmed = false
@@ -562,16 +592,28 @@ function obj:resetDisplayState(lunarName)
         string.format("%s displays \"%s\" brightness 50", self.lunarPath, lunarName)
     }
     
-    for _, cmd in ipairs(resetCommands) do
+    -- Execute commands sequentially with delays
+    local function executeCommand(index)
+        if index > #resetCommands then
+            self.state.failedRestoreAttempts = 0
+            return
+        end
+        
+        local cmd = resetCommands[index]
         log("Executing failsafe command: " .. cmd)
         local success, result = pcall(hs.execute, cmd)
         if not success then
             log(string.format("Failsafe command failed: %s", result), true)
         end
-        hs.timer.usleep(200000)
+        
+        -- Schedule next command after delay
+        hs.timer.doAfter(0.2, function()
+            executeCommand(index + 1)
+        end)
     end
-
-    self.state.failedRestoreAttempts = 0
+    
+    -- Start executing commands
+    executeCommand(1)
 end
 
 function obj:emergencyReset()
