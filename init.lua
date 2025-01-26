@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.63",
+    version = "4.64",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -477,170 +477,138 @@ end
 
 -- Restore brightness function
 function obj:restoreBrightness()
+    -- Bail out if we’ve failed too often or if locked
     if self.state.failedRestoreAttempts and self.state.failedRestoreAttempts >= 2 then
         log("Multiple restore attempts failed, performing emergency reset", true)
         self:emergencyReset()
         self.state.failedRestoreAttempts = 0
         return
     end
-
+    
     if self.state.lockState then
         log("Skipping brightness restore while system is locked")
         return
     end
-
+    
     if not self.state.isDimmed then
         log("Not currently dimmed, ignoring restore request")
         return
     end
-
-    log("restoreBrightness called")
     
+    log("restoreBrightness called")
     self.state.isRestoring = true
     
     local screens = self:sortScreensByPriority(hs.screen.allScreens())
-
-    function obj:restoreScreens()
-        -- Process screens one at a time
-        local function processScreen(index)
-            if index > #screens then
-                -- All screens processed
-                return
-            end
-            
-            local screen = screens[index]
-            local screenName = screen:name()
-            local lunarDisplays = self:getLunarDisplayNames()
-            local lunarName = lunarDisplays[screenName]
-            local originalBrightness = self.state.originalBrightness[screenName]
-            local originalSubzero = self.state.originalSubzero[screenName]
-            
-            if originalBrightness and lunarName then
-                log(string.format("Restoring state for '%s': brightness=%d, subzero=%s", 
-                    screenName, originalBrightness, tostring(originalSubzero)))
-    
-                -- First restore any subzero state if it existed
-                if originalSubzero and originalSubzero < 0 then
-                    self:setSubzeroDimming(screen, originalSubzero)
-                else
-                    self:disableSubzero(screen)
-                end
-                
-                hs.timer.doAfter(0.3, function()
-                    -- Then restore hardware brightness
-                    local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
-                        self.lunarPath, lunarName, originalBrightness)
-                    
-                    log("Executing: " .. cmdBrightness)
-                    local success, result = pcall(hs.execute, cmdBrightness)
-                    if not success then
-                        log(string.format("Error setting brightness: %s", result), true)
-                        self:resetDisplayState(lunarName)
-                    end
-    
-                    -- Verify the changes took effect
-                    hs.timer.doAfter(1.0, function()  -- Was 0.5 before
-                        local currentBrightness = self:getHardwareBrightness(screen)
-                        log(string.format("Verification for %s: expected=%d, current=%s", 
-                            screenName, originalBrightness, tostring(currentBrightness)))
-                            
-                        -- Try one more time if the first restore didn't take
-                        if currentBrightness and math.abs(currentBrightness - originalBrightness) > 10 then
-                            log(string.format("First restore attempt didn't take, trying again for %s", screenName))
-                            local cmd = string.format("%s displays \"%s\" brightness %d", 
-                                self.lunarPath, lunarName, originalBrightness)
-                            hs.execute(cmd)
-                            
-                            -- Check again after a longer delay
-                            hs.timer.doAfter(1.5, function()
-                                currentBrightness = self:getHardwareBrightness(screen)
-                                log(string.format("Second verification for %s: expected=%d, current=%s", 
-                                    screenName, originalBrightness, tostring(currentBrightness)))
-                                
-                                if currentBrightness and math.abs(currentBrightness - originalBrightness) <= 10 then
-                                    verificationsPassed = verificationsPassed + 1
-                                    if verificationsPassed == screensToVerify then
-                                        log("All screens verified successfully")
-                                        self.state.originalBrightness = {}
-                                        self.state.originalSubzero = {}
-                                    end
-                                else
-                                    log(string.format("Final brightness verification still different for %s: expected=%d, got=%d", 
-                                        screenName, originalBrightness, currentBrightness))
-                                end
-                            end)
-                        else
-                            verificationsPassed = verificationsPassed + 1
-                            if verificationsPassed == screensToVerify then
-                                log("All screens verified successfully")
-                                self.state.originalBrightness = {}
-                                self.state.originalSubzero = {}
-                            end
-                        end
-                    end)                    
-                end)
-            else
-                -- If screen was skipped, move to next one immediately
-                processScreen(index + 1)
-            end
-        end
-        
-        -- Start processing with first screen
-        processScreen(1)
-    end    
-
-    -- Reset most state immediately
-    self.state.isDimmed = false
-    self.state.dimmedBeforeLock = false
-    self.state.dimmedBeforeSleep = false
-    
-    -- Create a verification tracker
     local screensToVerify = #screens
     local verificationsPassed = 0
     
-    -- Final verification pass
--- Final verification pass
-for _, screen in ipairs(screens) do
-    local screenName = screen:name()
-    local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[screenName]
-    local originalBrightness = self.state.originalBrightness[screenName]
-    
-    hs.timer.doAfter(1.0, function()  -- Increased delay
-        local currentBrightness = self:getHardwareBrightness(screen)
-        log(string.format("Verification for %s: expected=%d, current=%s", 
-            screenName, originalBrightness, tostring(currentBrightness)))
+    -- We’ll process screens in sequence rather than all at once,
+    -- so we can do a per‐screen restore + verification.
+    local function restoreOneScreen(index)
+        if index > #screens then
+            -- Finished all screens
+            log(string.format("Processed all %d screens during restore", screensToVerify))
             
-        if currentBrightness and math.abs(currentBrightness - originalBrightness) > 10 then
-                log(string.format("Final brightness verification failed for %s. Attempting recovery...", screenName), true)
-                self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
-                -- Only call resetDisplayState if we have a valid lunarName
-                if lunarName then
-                    self:resetDisplayState(lunarName)
-                else
-                    log(string.format("Could not find Lunar name for display: %s", screenName), true)
-                end
+            -- If we got here, we consider the restore complete
+            -- (even if some had partial failures—adjust logic as desired)
+            self.state.isDimmed = false
+            self.state.dimmedBeforeLock = false
+            self.state.dimmedBeforeSleep = false
+            
+            -- If all verifications passed, reset counters & stored brightness
+            if verificationsPassed == screensToVerify then
+                log("All screens verified successfully, resetting failure counter")
+                self.state.failedRestoreAttempts = 0
+                self.state.originalBrightness = {}
+                self.state.originalSubzero = {}
             else
-                verificationsPassed = verificationsPassed + 1
-                
-                -- If all screens verified successfully, reset the failure counter
-                if verificationsPassed == screensToVerify then
-                    log("All screens verified successfully, resetting failure counter")
-                    self.state.failedRestoreAttempts = 0
-                    -- Only clear state storage after successful verification
-                    self.state.originalBrightness = {}
-                    self.state.originalSubzero = {}
-                end
+                log(string.format("Some screens did not verify (%d/%d)",
+                                  verificationsPassed, screensToVerify), true)
             end
+            
+            -- Mark restore done
+            self.state.isRestoring = false
+            log("Brightness restore completed")
+            return
+        end
+        
+        local screen = screens[index]
+        local screenName = screen:name()
+        local lunarDisplays = self:getLunarDisplayNames()
+        local lunarName   = lunarDisplays[screenName]
+        local originalBrightness = self.state.originalBrightness[screenName]
+        local originalSubzero    = self.state.originalSubzero[screenName]
+        
+        -- If no stored brightness, skip this screen (uncommon, but can happen).
+        if not (lunarName and originalBrightness) then
+            log(string.format(
+                "No stored brightness or missing Lunar name for %s; skipping restore", screenName
+            ))
+            return restoreOneScreen(index + 1)
+        end
+        
+        log(string.format(
+            "Restoring %s => brightness=%d, subzero=%s",
+            screenName, originalBrightness, tostring(originalSubzero)
+        ))
+        
+        -- Step 1: restore subzero
+        if originalSubzero and originalSubzero < 0 then
+            self:setSubzeroDimming(screen, originalSubzero)
+        else
+            self:disableSubzero(screen)
+        end
+        
+        -- Step 2: small delay for the subzero operation
+        hs.timer.doAfter(0.3, function()
+            -- Step 3: set the hardware brightness
+            local cmdBrightness = string.format(
+                "%s displays \"%s\" brightness %d", 
+                self.lunarPath, lunarName, originalBrightness
+            )
+            log("Executing: " .. cmdBrightness)
+            
+            local success, result = pcall(hs.execute, cmdBrightness)
+            if not success then
+                log(string.format("Error setting brightness for %s: %s", screenName, result), true)
+                self:resetDisplayState(lunarName)
+            end
+            
+            -- Step 4: verify after another short delay
+            hs.timer.doAfter(0.5, function()
+                local currentBrightness = self:getHardwareBrightness(screen)
+                log(string.format(
+                    "Verifying %s => expected=%d, current=%s",
+                    screenName, originalBrightness, tostring(currentBrightness)
+                ))
+                
+                if currentBrightness and 
+                   math.abs(currentBrightness - originalBrightness) > 5 then
+                   
+                    -- If first verification fails, try once more or do a failsafe
+                    log(string.format(
+                        "Brightness verification failed for %s. Attempting recovery...",
+                        screenName
+                    ), true)
+                    
+                    self.state.failedRestoreAttempts = 
+                        (self.state.failedRestoreAttempts or 0) + 1
+                        
+                    self:resetDisplayState(lunarName)
+                    -- We do *not* increment verificationsPassed
+                else
+                    -- Verified success
+                    verificationsPassed = verificationsPassed + 1
+                end
+                
+                -- Move on to the next screen
+                restoreOneScreen(index + 1)
+            end)
         end)
     end
     
-    -- Clear the restoration flag after all verifications should be complete
-    hs.timer.doAfter(1.5, function()
-        self.state.isRestoring = false
-    end)
-    
-    log("Brightness restore completed")
+    -- Start the per‐screen sequence
+    restoreOneScreen(1)
 end
 
 -- Failsafe to make sure subzero (gamma) is disabled
