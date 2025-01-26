@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.62",
+    version = "4.63",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -539,18 +539,45 @@ function obj:restoreBrightness()
                     end
     
                     -- Verify the changes took effect
-                    hs.timer.doAfter(0.5, function()
+                    hs.timer.doAfter(1.0, function()  -- Was 0.5 before
                         local currentBrightness = self:getHardwareBrightness(screen)
-                        if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
-                            log(string.format("Brightness verification failed for %s. Attempting recovery...", screenName), true)
-                            self:resetDisplayState(lunarName)
+                        log(string.format("Verification for %s: expected=%d, current=%s", 
+                            screenName, originalBrightness, tostring(currentBrightness)))
+                            
+                        -- Try one more time if the first restore didn't take
+                        if currentBrightness and math.abs(currentBrightness - originalBrightness) > 10 then
+                            log(string.format("First restore attempt didn't take, trying again for %s", screenName))
+                            local cmd = string.format("%s displays \"%s\" brightness %d", 
+                                self.lunarPath, lunarName, originalBrightness)
+                            hs.execute(cmd)
+                            
+                            -- Check again after a longer delay
+                            hs.timer.doAfter(1.5, function()
+                                currentBrightness = self:getHardwareBrightness(screen)
+                                log(string.format("Second verification for %s: expected=%d, current=%s", 
+                                    screenName, originalBrightness, tostring(currentBrightness)))
+                                
+                                if currentBrightness and math.abs(currentBrightness - originalBrightness) <= 10 then
+                                    verificationsPassed = verificationsPassed + 1
+                                    if verificationsPassed == screensToVerify then
+                                        log("All screens verified successfully")
+                                        self.state.originalBrightness = {}
+                                        self.state.originalSubzero = {}
+                                    end
+                                else
+                                    log(string.format("Final brightness verification still different for %s: expected=%d, got=%d", 
+                                        screenName, originalBrightness, currentBrightness))
+                                end
+                            end)
+                        else
+                            verificationsPassed = verificationsPassed + 1
+                            if verificationsPassed == screensToVerify then
+                                log("All screens verified successfully")
+                                self.state.originalBrightness = {}
+                                self.state.originalSubzero = {}
+                            end
                         end
-                        
-                        -- Process next screen after a delay
-                        hs.timer.doAfter(0.3, function()
-                            processScreen(index + 1)
-                        end)
-                    end)
+                    end)                    
                 end)
             else
                 -- If screen was skipped, move to next one immediately
