@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.61",
+    version = "4.62",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -572,15 +572,19 @@ function obj:restoreBrightness()
     local verificationsPassed = 0
     
     -- Final verification pass
-    for _, screen in ipairs(screens) do
-        local screenName = screen:name()
-        local lunarDisplays = self:getLunarDisplayNames()  -- Add this line
-        local lunarName = lunarDisplays[screenName]        -- Add this line
-        local originalBrightness = self.state.originalBrightness[screenName]
-        
-        hs.timer.doAfter(0.5, function()
-            local currentBrightness = self:getHardwareBrightness(screen)
-            if currentBrightness and math.abs(currentBrightness - originalBrightness) > 5 then
+-- Final verification pass
+for _, screen in ipairs(screens) do
+    local screenName = screen:name()
+    local lunarDisplays = self:getLunarDisplayNames()
+    local lunarName = lunarDisplays[screenName]
+    local originalBrightness = self.state.originalBrightness[screenName]
+    
+    hs.timer.doAfter(1.0, function()  -- Increased delay
+        local currentBrightness = self:getHardwareBrightness(screen)
+        log(string.format("Verification for %s: expected=%d, current=%s", 
+            screenName, originalBrightness, tostring(currentBrightness)))
+            
+        if currentBrightness and math.abs(currentBrightness - originalBrightness) > 10 then
                 log(string.format("Final brightness verification failed for %s. Attempting recovery...", screenName), true)
                 self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
                 -- Only call resetDisplayState if we have a valid lunarName
