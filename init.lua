@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.7",
+    version = "4.71",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -154,7 +154,7 @@ function obj:getLunarDisplayNames()
     
     return displays
 end
-
+:qa
 function obj:sortScreensByPriority(screens)
     -- If no priorities configured, return screens in original order
     if not self.config.displayPriorities or not next(self.config.displayPriorities) then
