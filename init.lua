@@ -99,24 +99,48 @@ function obj:getLunarDisplayNames()
 
     local displays = {}
     local currentDisplay = nil
+    local currentEDIDName = nil
+    
     for line in output:gmatch("[^\r\n]+") do
         -- Match the display header line (e.g., "0: Built-in")
-        local num, name = line:match("^(%d+):%s+([^%s]+)$")
+        local num, name = line:match("^(%d+):%s+(.+)$")
         -- Or match the EDID Name line
-        local edidName = line:match("^%s*EDID Name:%s+([^%s]+)$")
+        local edidName = line:match("^%s*EDID Name:%s+(.+)$")
         
         if num and name then
             currentDisplay = name
-            displays[name] = name  -- Direct mapping
+            currentEDIDName = nil
+            -- Add direct mapping
+            displays[name] = name
+            
+            -- Special case for Built-in display
             if name == "Built-in" then
                 displays["Built-in Retina Display"] = "Built-in"
             end
-            log(string.format("Added display mapping: %s -> %s", name, displays[name]))
+            
+            log(string.format("Added primary mapping: %s -> %s", name, name))
+            
         elseif edidName and currentDisplay then
-            -- Additional mapping using EDID name if different
+            currentEDIDName = edidName
+            -- Add EDID mapping if different from current display name
             if edidName ~= currentDisplay then
                 displays[edidName] = currentDisplay
                 log(string.format("Added EDID mapping: %s -> %s", edidName, currentDisplay))
+            end
+            
+            -- Try variations of the name
+            local variations = {
+                edidName,
+                edidName:gsub(" ", ""),  -- Remove spaces
+                edidName:gsub("%-", " "), -- Replace hyphens with spaces
+                edidName:gsub(" ", "-")   -- Replace spaces with hyphens
+            }
+            
+            for _, variant in ipairs(variations) do
+                if variant ~= currentDisplay and variant ~= edidName then
+                    displays[variant] = currentDisplay
+                    log(string.format("Added variant mapping: %s -> %s", variant, currentDisplay))
+                end
             end
         end
     end
