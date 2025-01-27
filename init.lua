@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "4.71",
+    version = "5.0",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -19,9 +19,6 @@ local obj = {
         -- Negative values use subzero (gamma mode)
         -- Positive values use regular (hardware) brightness
         dimLevel = 10,
-
-        -- Internal display ± gain level (added to dimLevel)
-        internalDisplayGainLevel = 0,  -- No gain by default
 
         -- The default path for Lunar CLI command
         lunarPath = "~/.local/bin/lunar",
@@ -155,9 +152,42 @@ function obj:getLunarDisplayNames()
     return displays
 end
 
+-- Configuration parser
+function obj:parseDisplayConfig(config)
+    local displays = {}
+    
+    -- Handle both old and new format
+    if config.displays then
+        -- New format
+        for name, settings in pairs(config.displays) do
+            displays[name] = {
+                priority = settings.priority or self.config.defaultDisplayPriority,
+                dimLevel = settings.dimLevel
+            }
+        end
+    elseif config.displayPriorities then
+        -- Old format compatibility
+        for name, value in pairs(config.displayPriorities) do
+            if type(value) == "number" then
+                displays[name] = {
+                    priority = value,
+                    dimLevel = nil
+                }
+            elseif type(value) == "table" then
+                displays[name] = {
+                    priority = value[1] or self.config.defaultDisplayPriority,
+                    dimLevel = value[2]
+                }
+            end
+        end
+    end
+    
+    return displays
+end
+
 function obj:sortScreensByPriority(screens)
     -- If no priorities configured, return screens in original order
-    if not self.config.displayPriorities or not next(self.config.displayPriorities) then
+    if not self.config.displays or not next(self.config.displays) then
         return screens
     end
     
@@ -167,21 +197,394 @@ function obj:sortScreensByPriority(screens)
     end
     
     table.sort(prioritizedScreens, function(a, b)
-        local priorityA = self.config.displayPriorities[a:name()] or self.config.defaultDisplayPriority
-        local priorityB = self.config.displayPriorities[b:name()] or self.config.defaultDisplayPriority
+        local settingsA = self.config.displays[a:name()] or {}
+        local settingsB = self.config.displays[b:name()] or {}
+        local priorityA = settingsA.priority or self.config.defaultDisplayPriority
+        local priorityB = settingsB.priority or self.config.defaultDisplayPriority
         return priorityA < priorityB
     end)
     
-    -- Log the priority order if logging is enabled
+    -- Log the priority order
     if self.config.logging then
         log("Display priority order:")
         for i, screen in ipairs(prioritizedScreens) do
-            local priority = self.config.displayPriorities[screen:name()] or self.config.defaultDisplayPriority
+            local settings = self.config.displays[screen:name()] or {}
+            local priority = settings.priority or self.config.defaultDisplayPriority
             log(string.format("  %d. %s (priority: %d)", i, screen:name(), priority))
         end
     end
     
     return prioritizedScreens
+end
+
+-- Helper method for display configuration
+function obj:display(priority, dimLevel)
+    return {
+        priority = priority,
+        dimLevel = dimLevel
+    }
+end
+
+-- Initialize ScreenDimmer
+function obj:init()
+    if self.state.isInitialized then
+        if self.config.logging then
+            log("Already initialized, returning")
+        end
+        return self
+    end
+
+    if self.config.logging then
+        log("Initializing ScreenDimmer", true)
+    end
+
+    if not self:checkAccessibility() then
+        log("Waiting for accessibility permissions...", true)
+        return self
+    end
+
+    -- Initialize basic state
+    self.state = {
+        isInitialized = false,  -- Will be set to true after successful configuration
+        isDimmed = false,
+        isEnabled = false,
+        isRestoring = false,
+        isUnlocking = false,
+        lockState = false,
+        originalBrightness = {},
+        lastWakeTime = hs.timer.secondsSinceEpoch(),
+        lastUserAction = hs.timer.secondsSinceEpoch(),
+        lastUnlockTime = hs.timer.secondsSinceEpoch(),
+        lastUnlockEventTime = 0,
+        lastHotkeyTime = 0,
+        lastRestoreTime = 0,
+        failedRestoreAttempts = 0,
+        lastLunarRestart = 0,
+        screenWatcher = nil,
+        unlockTimer = nil
+    }
+
+    -- Setup screen watcher
+    self:setupScreenWatcher()
+
+    -- Create state checker timer
+    self.stateChecker = hs.timer.new(
+        self.config.checkInterval, 
+        function() self:checkAndUpdateState() end
+    )
+
+    -- Setup user activity watcher
+    self.userActionWatcher = hs.eventtap.new({
+        hs.eventtap.event.types.keyDown,
+        hs.eventtap.event.types.flagsChanged,
+        hs.eventtap.event.types.leftMouseDown,
+        hs.eventtap.event.types.rightMouseDown,
+        hs.eventtap.event.types.mouseMoved
+    }, function(event)
+        if self.state.lockState or self.state.isUnlocking or self.state.isRestoring then
+            return false
+        end
+    
+        local now = hs.timer.secondsSinceEpoch()
+    
+        -- Add safety check for lastScreenSaverEvent
+        local screenSaverCooldown = (self.state.lastScreenSaverEvent and 
+            (now - self.state.lastScreenSaverEvent) < 3.0)
+    
+        -- Strict ignore period after hotkey or screen events
+        if (now - self.state.lastHotkeyTime) < 2.0 or screenSaverCooldown then
+            if self.config.logging then
+                log("Ignoring user activity during cooldown period")
+            end
+            return false
+        end
+    
+        -- Only process events if enough time has passed since last action
+        if (now - self.state.lastUserAction) > 0.1 then
+            self.state.lastUserAction = now
+    
+            if self.state.isDimmed and not self.state.isHotkeyDimming then
+                if self.config.logging then
+                    log("User action while dimmed, restoring brightness")
+                end
+                self:restoreBrightness()
+            end
+        end
+        
+        return false
+    end)
+
+    if not self.userActionWatcher then
+        log("Failed to create eventtap. Please check Accessibility permissions.", true)
+    end
+
+    -- Setup caffeine watcher
+    self.caffeineWatcher = hs.caffeinate.watcher.new(function(eventType)
+        self:caffeineWatcherCallback(eventType)
+    end)
+
+    if self.config.logging then
+        log("Basic initialization complete")
+    end
+    
+    return self
+end
+
+-- Setup screen watcher
+function obj:setupScreenWatcher()
+    self.state.lastScreenChangeTime = 0
+    self.state.screenChangeDebounceInterval = 1.0  -- 1 second
+
+    self.state.screenWatcher = hs.screen.watcher.new(function()
+        local now = hs.timer.secondsSinceEpoch()
+        
+        -- Debounce rapid screen change events
+        if (now - self.state.lastScreenChangeTime) < self.state.screenChangeDebounceInterval then
+            if self.config.logging then
+                log("Debouncing rapid screen configuration change")
+            end
+            return
+        end
+        
+        self.state.lastScreenChangeTime = now
+        log("Screen configuration changed", true)
+        
+        -- Clear the display mappings cache
+        self:clearDisplayCache()
+        
+        -- Log current screen configuration
+        local screens = hs.screen.allScreens()
+        log(string.format("New screen configuration detected: %d display(s)", #screens))
+        for _, screen in ipairs(screens) do
+            log(string.format("- Display: %s", screen:name()))
+        end
+        
+        -- Wait a brief moment for the system to stabilize
+        hs.timer.doAfter(2, function()
+            -- If screens were dimmed, reapply dimming to all screens
+            if self.state.isDimmed then
+                log("Reapplying dim settings to new screen configuration")
+                -- Store current dim state
+                local wasDimmed = self.state.isDimmed
+                -- Reset dim state temporarily
+                self.state.isDimmed = false
+                -- Reapply dimming
+                if wasDimmed then
+                    self:dimScreens()
+                end
+            else
+                log("Screens were not dimmed, no action needed")
+            end
+        end)
+    end)
+    self.state.screenWatcher:start()
+    log("Screen watcher initialized and started")
+end
+
+-- Check and update state function
+function obj:checkAndUpdateState()
+    if not self.state.isEnabled then
+        return
+    end
+
+    if self.state.lockState or self.state.isUnlocking then
+        log("Skipping state check due to lock/unlock state")
+        return
+    end
+
+    local now = hs.timer.secondsSinceEpoch()
+    local timeSinceLastAction = now - self.state.lastUserAction
+
+    if self.config.logging then
+        log(string.format("timeSinceLastAction = %.1f seconds (timeout: %d)",
+                          timeSinceLastAction, self.config.idleTimeout))
+    end
+
+    if timeSinceLastAction >= self.config.idleTimeout then
+        if not self.state.isDimmed then
+            self:dimScreens()
+        end
+    end
+end
+
+-- Configuration function
+function obj:configure(config)
+    log("Configuring variables...")
+    if config then
+        log(".. with overriding values:")
+        -- Apply all configurations except display settings
+        for k, v in pairs(config) do
+            if k ~= "displays" and k ~= "displayPriorities" then
+                self.config[k] = v
+            end
+        end
+        
+        -- Parse display configuration
+        self.config.displays = self:parseDisplayConfig(config)
+    end
+
+    -- Verify lunar CLI path
+    if not self.config.lunarPath then
+        log("ERROR: Lunar CLI path not configured! Please set config.lunarPath.", true)
+        return self
+    end
+
+    -- Test lunar command
+    local testCmd = string.format("%s --help", self.config.lunarPath)
+    local output, status = hs.execute(testCmd)
+    if not status then
+        log("ERROR: Unable to execute lunar command. Please verify the configured lunar path: " .. self.config.lunarPath, true)
+        return self
+    end
+
+    -- Store the lunar path
+    self.lunarPath = self.config.lunarPath
+    if self.config.logging then
+        log("Successfully initialized Lunar CLI at: " .. self.lunarPath, true)
+    end
+
+    -- Mark as initialized
+    self.state.isInitialized = true
+
+    if self.config.logging then
+        log("Configuration now:", true)
+        for k, v in pairs(self.config) do
+            if k ~= "displays" then
+                log(string.format("  - %s: %s", k, tostring(v)), true)
+            end
+        end
+        -- Log display configurations separately
+        log("Display configurations:", true)
+        for name, settings in pairs(self.config.displays or {}) do
+            log(string.format("  - %s: priority=%d, dimLevel=%s",
+                name,
+                settings.priority,
+                settings.dimLevel and tostring(settings.dimLevel) or "default"
+            ), true)
+        end
+    end
+
+    return self
+end
+
+-- Start the ScreenDimmer
+function obj:start(showAlert)
+    if not self.state.isInitialized then
+        log("ERROR: Cannot start ScreenDimmer - not properly initialized", true)
+        return self
+    end
+
+    if self.state.isEnabled then
+        return self
+    end
+
+    log("Starting ScreenDimmer", true)
+    self.state.isEnabled = true
+
+    -- Try to start the userActionWatcher with retries
+    local maxRetries = 3
+    local retryDelay = 2 -- seconds
+    local retryCount = 0
+    
+    local function startWatcher()
+        if not self.userActionWatcher then
+            retryCount = retryCount + 1
+            if retryCount <= maxRetries then
+                log(string.format("Retry %d/%d: Eventtap not available, retrying creation in %d seconds...", 
+                    retryCount, maxRetries, retryDelay))
+                
+                -- Try to recreate the eventtap
+                self.userActionWatcher = hs.eventtap.new({
+                    hs.eventtap.event.types.keyDown,
+                    hs.eventtap.event.types.flagsChanged,
+                    hs.eventtap.event.types.leftMouseDown,
+                    hs.eventtap.event.types.rightMouseDown,
+                    hs.eventtap.event.types.mouseMoved
+                }, function(event)
+                    -- ... event handling code ...
+                end)
+                
+                hs.timer.doAfter(retryDelay, startWatcher)
+            else
+                log("Failed to create eventtap after all retries. Please check Accessibility permissions.", true)
+                hs.alert.show("⚠️ Failed to start user activity monitoring\nPlease check Accessibility permissions", 5)
+            end
+        else
+            -- If we have a valid eventtap object, start it
+            self.userActionWatcher:start()
+            log("User activity watcher started successfully")
+        end
+    end
+    
+    startWatcher()
+
+    -- Start all other watchers
+    if self.stateChecker then
+        self.stateChecker:start()
+    end
+    if self.caffeineWatcher then
+        self.caffeineWatcher:start()
+    end
+    if self.state.screenWatcher then
+        self.state.screenWatcher:start()
+    end
+
+    -- Reset state
+    self:resetState()
+    self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+
+    if showAlert ~= false then
+        hs.alert.show("Screen Dimmer Started")
+    end
+
+    return self
+end
+
+-- Stop the ScreenDimmer
+function obj:stop(showAlert)
+    if not self.state.isEnabled then
+        return self
+    end
+
+    log("Stopping ScreenDimmer", true)
+    self.state.isEnabled = false
+
+    -- Stop all watchers
+    if self.stateChecker then
+        self.stateChecker:stop()
+    end
+    if self.userActionWatcher then
+        self.userActionWatcher:stop()
+    end
+    if self.caffeineWatcher then
+        self.caffeineWatcher:stop()
+    end
+    if self.state.screenWatcher then
+        self.state.screenWatcher:stop()
+    end
+
+    -- Restore brightness if dimmed
+    if self.state.isDimmed then
+        self:restoreBrightness()
+    end
+
+    -- Reset state
+    self:resetState()
+
+    if showAlert ~= false then
+        hs.alert.show("Screen Dimmer Stopped")
+    end
+
+    return self
+end
+
+-- Toggle the ScreenDimmer
+function obj:toggle()
+    if self.state.isEnabled then
+        self:stop()
+    else
+        self:start()
+    end
 end
 
 -- Get hardware brightness (without subzero/gamma effects)
@@ -398,13 +801,16 @@ function obj:dimScreens()
         end
 
         -- Calculate final dim level
-        local finalLevel = self.config.dimLevel
-        if finalLevel == 0 then finalLevel = -1 end
-        
-        if screenName:match("Built%-in") then
-            finalLevel = finalLevel + (self.config.internalDisplayGainLevel or 0)
-            finalLevel = math.max(-100, math.min(100, finalLevel))
+        local displaySettings = self.config.displays[screenName] or {}
+        local finalLevel = displaySettings.dimLevel or self.config.dimLevel
+
+        -- Special handling for 0: treat it as -1 (minimal gamma dimming)
+        if finalLevel == 0 then
+            finalLevel = -1
         end
+
+        -- Ensure within bounds
+        finalLevel = math.max(-100, math.min(100, finalLevel))
 
         -- Store all computed values
         self.state.originalBrightness[screenName] = currentBrightness
@@ -755,352 +1161,6 @@ function obj:emergencyReset()
         self:clearDisplayCache()
         hs.alert.show("🌙 Lunar restarted", 3)
     end)
-end
-
--- Initialize ScreenDimmer
-function obj:init()
-    if self.state.isInitialized then
-        if self.config.logging then
-            log("Already initialized, returning")
-        end
-        return self
-    end
-
-    if self.config.logging then
-        log("Initializing ScreenDimmer", true)
-    end
-
-    if not self:checkAccessibility() then
-        log("Waiting for accessibility permissions...", true)
-        return self
-    end
-
-    -- Initialize basic state
-    self.state = {
-        isInitialized = false,  -- Will be set to true after successful configuration
-        isDimmed = false,
-        isEnabled = false,
-        isRestoring = false,
-        isUnlocking = false,
-        lockState = false,
-        originalBrightness = {},
-        lastWakeTime = hs.timer.secondsSinceEpoch(),
-        lastUserAction = hs.timer.secondsSinceEpoch(),
-        lastUnlockTime = hs.timer.secondsSinceEpoch(),
-        lastUnlockEventTime = 0,
-        lastHotkeyTime = 0,
-        lastRestoreTime = 0,
-        failedRestoreAttempts = 0,
-        lastLunarRestart = 0,
-        screenWatcher = nil,
-        unlockTimer = nil
-    }
-
-    -- Setup screen watcher
-    self:setupScreenWatcher()
-
-    -- Create state checker timer
-    self.stateChecker = hs.timer.new(
-        self.config.checkInterval, 
-        function() self:checkAndUpdateState() end
-    )
-
-    -- Setup user activity watcher
-    self.userActionWatcher = hs.eventtap.new({
-        hs.eventtap.event.types.keyDown,
-        hs.eventtap.event.types.flagsChanged,
-        hs.eventtap.event.types.leftMouseDown,
-        hs.eventtap.event.types.rightMouseDown,
-        hs.eventtap.event.types.mouseMoved
-    }, function(event)
-        if self.state.lockState or self.state.isUnlocking or self.state.isRestoring then
-            return false
-        end
-    
-        local now = hs.timer.secondsSinceEpoch()
-    
-        -- Add safety check for lastScreenSaverEvent
-        local screenSaverCooldown = (self.state.lastScreenSaverEvent and 
-            (now - self.state.lastScreenSaverEvent) < 3.0)
-    
-        -- Strict ignore period after hotkey or screen events
-        if (now - self.state.lastHotkeyTime) < 2.0 or screenSaverCooldown then
-            if self.config.logging then
-                log("Ignoring user activity during cooldown period")
-            end
-            return false
-        end
-    
-        -- Only process events if enough time has passed since last action
-        if (now - self.state.lastUserAction) > 0.1 then
-            self.state.lastUserAction = now
-    
-            if self.state.isDimmed and not self.state.isHotkeyDimming then
-                if self.config.logging then
-                    log("User action while dimmed, restoring brightness")
-                end
-                self:restoreBrightness()
-            end
-        end
-        
-        return false
-    end)
-
-    if not self.userActionWatcher then
-        log("Failed to create eventtap. Please check Accessibility permissions.", true)
-    end
-
-    -- Setup caffeine watcher
-    self.caffeineWatcher = hs.caffeinate.watcher.new(function(eventType)
-        self:caffeineWatcherCallback(eventType)
-    end)
-
-    if self.config.logging then
-        log("Basic initialization complete")
-    end
-    
-    return self
-end
-
--- Setup screen watcher
-function obj:setupScreenWatcher()
-    self.state.lastScreenChangeTime = 0
-    self.state.screenChangeDebounceInterval = 1.0  -- 1 second
-
-    self.state.screenWatcher = hs.screen.watcher.new(function()
-        local now = hs.timer.secondsSinceEpoch()
-        
-        -- Debounce rapid screen change events
-        if (now - self.state.lastScreenChangeTime) < self.state.screenChangeDebounceInterval then
-            if self.config.logging then
-                log("Debouncing rapid screen configuration change")
-            end
-            return
-        end
-        
-        self.state.lastScreenChangeTime = now
-        log("Screen configuration changed", true)
-        
-        -- Clear the display mappings cache
-        self:clearDisplayCache()
-        
-        -- Log current screen configuration
-        local screens = hs.screen.allScreens()
-        log(string.format("New screen configuration detected: %d display(s)", #screens))
-        for _, screen in ipairs(screens) do
-            log(string.format("- Display: %s", screen:name()))
-        end
-        
-        -- Wait a brief moment for the system to stabilize
-        hs.timer.doAfter(2, function()
-            -- If screens were dimmed, reapply dimming to all screens
-            if self.state.isDimmed then
-                log("Reapplying dim settings to new screen configuration")
-                -- Store current dim state
-                local wasDimmed = self.state.isDimmed
-                -- Reset dim state temporarily
-                self.state.isDimmed = false
-                -- Reapply dimming
-                if wasDimmed then
-                    self:dimScreens()
-                end
-            else
-                log("Screens were not dimmed, no action needed")
-            end
-        end)
-    end)
-    self.state.screenWatcher:start()
-    log("Screen watcher initialized and started")
-end
-
--- Check and update state function
-function obj:checkAndUpdateState()
-    if not self.state.isEnabled then
-        return
-    end
-
-    if self.state.lockState or self.state.isUnlocking then
-        log("Skipping state check due to lock/unlock state")
-        return
-    end
-
-    local now = hs.timer.secondsSinceEpoch()
-    local timeSinceLastAction = now - self.state.lastUserAction
-
-    if self.config.logging then
-        log(string.format("timeSinceLastAction = %.1f seconds (timeout: %d)",
-                          timeSinceLastAction, self.config.idleTimeout))
-    end
-
-    if timeSinceLastAction >= self.config.idleTimeout then
-        if not self.state.isDimmed then
-            self:dimScreens()
-        end
-    end
-end
-
--- Configuration function
-function obj:configure(config)
-    log("Configuring variables...")
-    if config then
-        log(".. with overriding values:")
-        -- Apply all configurations
-        for k, v in pairs(config) do
-            self.config[k] = v
-        end
-    end
-
-    -- Verify lunar CLI path
-    if not self.config.lunarPath then
-        log("ERROR: Lunar CLI path not configured! Please set config.lunarPath.", true)
-        return self
-    end
-
-    -- Test if lunar command works - using a simple --help command
-    local testCmd = string.format("%s --help", self.config.lunarPath)
-    local output, status = hs.execute(testCmd)
-    if not status then
-        log("ERROR: Unable to execute lunar command. Please verify the configured lunar path: " .. self.config.lunarPath, true)
-        return self
-    end
-
-    -- Store the lunar path for future use
-    self.lunarPath = self.config.lunarPath
-    if self.config.logging then
-        log("Successfully initialized Lunar CLI at: " .. self.lunarPath, true)
-    end
-
-    -- Mark as initialized only after successful configuration
-    self.state.isInitialized = true
-
-    if self.config.logging then
-        log("Configuration now:", true)
-        for k, v in pairs(self.config) do
-            log(string.format("  - %s: %s", k, tostring(v)), true)
-        end
-    end
-
-    return self
-end
-
--- Start the ScreenDimmer
-function obj:start(showAlert)
-    if not self.state.isInitialized then
-        log("ERROR: Cannot start ScreenDimmer - not properly initialized", true)
-        return self
-    end
-
-    if self.state.isEnabled then
-        return self
-    end
-
-    log("Starting ScreenDimmer", true)
-    self.state.isEnabled = true
-
-    -- Try to start the userActionWatcher with retries
-    local maxRetries = 3
-    local retryDelay = 2 -- seconds
-    local retryCount = 0
-    
-    local function startWatcher()
-        if not self.userActionWatcher then
-            retryCount = retryCount + 1
-            if retryCount <= maxRetries then
-                log(string.format("Retry %d/%d: Eventtap not available, retrying creation in %d seconds...", 
-                    retryCount, maxRetries, retryDelay))
-                
-                -- Try to recreate the eventtap
-                self.userActionWatcher = hs.eventtap.new({
-                    hs.eventtap.event.types.keyDown,
-                    hs.eventtap.event.types.flagsChanged,
-                    hs.eventtap.event.types.leftMouseDown,
-                    hs.eventtap.event.types.rightMouseDown,
-                    hs.eventtap.event.types.mouseMoved
-                }, function(event)
-                    -- ... event handling code ...
-                end)
-                
-                hs.timer.doAfter(retryDelay, startWatcher)
-            else
-                log("Failed to create eventtap after all retries. Please check Accessibility permissions.", true)
-                hs.alert.show("⚠️ Failed to start user activity monitoring\nPlease check Accessibility permissions", 5)
-            end
-        else
-            -- If we have a valid eventtap object, start it
-            self.userActionWatcher:start()
-            log("User activity watcher started successfully")
-        end
-    end
-    
-    startWatcher()
-
-    -- Start all other watchers
-    if self.stateChecker then
-        self.stateChecker:start()
-    end
-    if self.caffeineWatcher then
-        self.caffeineWatcher:start()
-    end
-    if self.state.screenWatcher then
-        self.state.screenWatcher:start()
-    end
-
-    -- Reset state
-    self:resetState()
-    self.state.lastUserAction = hs.timer.secondsSinceEpoch()
-
-    if showAlert ~= false then
-        hs.alert.show("Screen Dimmer Started")
-    end
-
-    return self
-end
-
--- Stop the ScreenDimmer
-function obj:stop(showAlert)
-    if not self.state.isEnabled then
-        return self
-    end
-
-    log("Stopping ScreenDimmer", true)
-    self.state.isEnabled = false
-
-    -- Stop all watchers
-    if self.stateChecker then
-        self.stateChecker:stop()
-    end
-    if self.userActionWatcher then
-        self.userActionWatcher:stop()
-    end
-    if self.caffeineWatcher then
-        self.caffeineWatcher:stop()
-    end
-    if self.state.screenWatcher then
-        self.state.screenWatcher:stop()
-    end
-
-    -- Restore brightness if dimmed
-    if self.state.isDimmed then
-        self:restoreBrightness()
-    end
-
-    -- Reset state
-    self:resetState()
-
-    if showAlert ~= false then
-        hs.alert.show("Screen Dimmer Stopped")
-    end
-
-    return self
-end
-
--- Toggle the ScreenDimmer
-function obj:toggle()
-    if self.state.isEnabled then
-        self:stop()
-    else
-        self:start()
-    end
 end
 
 -- Toggle between dimmed and normal brightness states
