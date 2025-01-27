@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.0",
+    version = "5.1",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -1019,35 +1019,35 @@ function obj:restoreBrightness()
             screenName, originalBrightness, tostring(originalSubzero)
         ))
         
-        -- Restore subzero state if needed
-        if originalSubzero and originalSubzero < 0 then
-            self:setSubzeroDimming(screen, originalSubzero)
-        else
-            -- Only disable if currently active
-            local currentSubzero = self:getSubzeroDimming(screen)
-            if currentSubzero and currentSubzero < 0 then
-                self:disableSubzero(screen)
-            end
+        -- First set the hardware brightness
+        local cmdBrightness = string.format(
+            "%s displays \"%s\" brightness %d", 
+            self.lunarPath, lunarName, originalBrightness
+        )
+        log("Executing: " .. cmdBrightness)
+        
+        local success, result = pcall(hs.execute, cmdBrightness)
+        if not success then
+            log(string.format("Error setting brightness for %s: %s", 
+                screenName, result), true)
+            self:resetDisplayState(lunarName)
+            return restoreOneScreen(index + 1)
         end
         
-        -- Wait for subzero changes to take effect
-        hs.timer.doAfter(0.3, function()
-            -- Set hardware brightness
-            local cmdBrightness = string.format(
-                "%s displays \"%s\" brightness %d", 
-                self.lunarPath, lunarName, originalBrightness
-            )
-            log("Executing: " .. cmdBrightness)
-            
-            local success, result = pcall(hs.execute, cmdBrightness)
-            if not success then
-                log(string.format("Error setting brightness for %s: %s", 
-                    screenName, result), true)
-                self:resetDisplayState(lunarName)
-                return restoreOneScreen(index + 1)
+        -- Short wait for brightness to take effect
+        hs.timer.doAfter(0.2, function()
+            -- Then handle subzero state
+            if originalSubzero and originalSubzero < 0 then
+                self:setSubzeroDimming(screen, originalSubzero)
+            else
+                -- Only disable if currently active
+                local currentSubzero = self:getSubzeroDimming(screen)
+                if currentSubzero and currentSubzero < 0 then
+                    self:disableSubzero(screen)
+                end
             end
             
-            -- Verify after a delay
+            -- Verify after all changes are complete
             hs.timer.doAfter(0.5, function()
                 if verifyScreen(screen, originalBrightness) then
                     verificationsPassed = verificationsPassed + 1
