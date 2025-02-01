@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.2",
+    version = "5.5",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -608,7 +608,11 @@ function obj:getHardwareBrightness(screen)
     if currentSubzero and currentSubzero < 0 then
         local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
             self.lunarPath, lunarName)
-        pcall(hs.execute, cmdDisableSubzero)
+
+        if not self:executeLunarCommand(cmdDisableSubzero) then
+            log("Failed to disable subzero for hardware brightness read", true)
+            return nil
+        end
         hs.timer.usleep(200000)  -- short wait only if we toggled subzero
     end
 
@@ -619,13 +623,13 @@ function obj:getHardwareBrightness(screen)
     local command = string.format("%s displays \"%s\" brightness --read", 
         self.lunarPath, lunarName)
     
-    local success, output, status = pcall(hs.execute, command)
-    if not success or not status then
-        log(string.format("Error reading hardware brightness: %s", output), true)
+    local success, output = self:executeLunarCommand(command)
+    if not success then
+        log("Failed to read hardware brightness", true)
         return nil
     end
-
-    local brightness = output:match("brightness:%s*(%d+)")
+    
+    local brightness = output and output:match("brightness:%s*(%d+)")
     return brightness and tonumber(brightness)
 end
 
@@ -645,12 +649,11 @@ function obj:setBrightness(screen, targetValue)
         local cmd = string.format("%s displays \"%s\" subzeroDimming %.2f", 
             self.lunarPath, lunarName, (100 + targetValue) / 100)
 
-        local success, result = pcall(hs.execute, cmd)
-        if not success then
-            log(string.format("Error executing Lunar command: %s", result), true)
+        if not self:executeLunarCommand(cmd) then
+            log("Failed to set brightness after retries", true)
             return false
         end
-        
+
         log(string.format("Set subzero brightness for '%s': %.2f", 
             screenName, (100 + targetValue) / 100))
     else
@@ -660,9 +663,8 @@ function obj:setBrightness(screen, targetValue)
             local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
                 self.lunarPath, lunarName)
             
-            local success, result = pcall(hs.execute, cmdDisableSubzero)
-            if not success then
-                log(string.format("Error disabling subzero: %s", result), true)
+            if not self:executeLunarCommand(cmdDisableSubzero) then
+                log("Failed to disable subzero", true)
                 return false
             end
             
@@ -674,9 +676,8 @@ function obj:setBrightness(screen, targetValue)
         local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
             self.lunarPath, lunarName, targetValue)
         
-        local success, result = pcall(hs.execute, cmdBrightness)
-        if not success then
-            log(string.format("Error setting brightness: %s", result), true)
+        if not self:executeLunarCommand(cmdBrightness) then
+            log("Failed to set brightness", true)
             return false
         end
         
@@ -701,15 +702,13 @@ function obj:getSubzeroDimming(screen)
     local command = string.format("%s displays \"%s\" subzeroDimming", 
         self.lunarPath, lunarName)
     
-    local success, output, status = pcall(hs.execute, command)
-    if not success or not status then
-        log(string.format("Error reading subzero dimming: %s", output), true)
+    local success, output = self:executeLunarCommand(command)
+    if not success then
+        log("Failed to read subzero dimming", true)
         return nil
     end
 
-    -- The output should be a decimal between 0 and 1
-    -- Convert it to our -100 to 0 scale
-    local dimming = output:match("subzeroDimming:%s*([%d%.]+)")
+    local dimming = output and output:match("subzeroDimming:%s*([%d%.]+)")
     if dimming then
         local value = tonumber(dimming)
         -- Convert from 0-1 range to our -100-0 range
@@ -729,15 +728,17 @@ function obj:setSubzeroDimming(screen, level)
     -- Enable subzero mode
     local cmdEnableSubzero = string.format("%s displays \"%s\" subzero true", 
         self.lunarPath, lunarName)
-    pcall(hs.execute, cmdEnableSubzero)
+        
+    if not self:executeLunarCommand(cmdEnableSubzero) then
+        return false
+    end
     
     -- Set dimming level (convert from -100..0 to 0..1 range)
     local dimming = (100 + level) / 100  -- level is negative
     local cmdSetDimming = string.format("%s displays \"%s\" subzeroDimming %.2f", 
         self.lunarPath, lunarName, dimming)
     
-    local success = pcall(hs.execute, cmdSetDimming)
-    return success
+    return self:executeLunarCommand(cmdSetDimming)
 end
 
 -- Disable subzero dimming
@@ -750,7 +751,8 @@ function obj:disableSubzero(screen)
     
     local cmd = string.format("%s displays \"%s\" subzero false", 
         self.lunarPath, lunarName)
-    return pcall(hs.execute, cmd)
+    
+    return self:executeLunarCommand(cmd)
 end
 
 -- Clear the cache when needed
@@ -760,6 +762,22 @@ end
 
 -- Dim screens function
 function obj:dimScreens()
+    if not self.state.isEnabled then
+        log("ScreenDimmer is not enabled, skipping dim", true)
+        return
+    end
+
+    local screens = self:sortScreensByPriority(hs.screen.allScreens())
+    if #screens == 0 then
+        log("No screens available to dim", true)
+        return
+    end
+    
+    if not self:getLunarDisplayNames() then
+        log("No Lunar display mappings available", true)
+        return
+    end
+
     -- Bail out checks
     if self.state.isDimmed or not self.state.isEnabled then
         log("dimScreens called but already dimmed or not enabled")
@@ -940,6 +958,21 @@ end
 
 -- Restore brightness function
 function obj:restoreBrightness()
+    if self.state.restoreInProgress then
+        log("Restore already in progress, skipping")
+        return
+    end
+    
+    self.state.restoreInProgress = true
+    
+    -- Set a safety timeout
+    hs.timer.doAfter(30, function()
+        if self.state.restoreInProgress then
+            log("Force-clearing stuck restoreInProgress flag", true)
+            self.state.restoreInProgress = false
+        end
+    end)
+
     -- Bail out checks
     if self.state.failedRestoreAttempts and self.state.failedRestoreAttempts >= 2 then
         log("Multiple restore attempts failed, performing emergency reset", true)
@@ -1031,10 +1064,8 @@ function obj:restoreBrightness()
         )
         log("Executing: " .. cmdBrightness)
         
-        local success, result = pcall(hs.execute, cmdBrightness)
-        if not success then
-            log(string.format("Error setting brightness for %s: %s", 
-                screenName, result), true)
+        if not self:executeLunarCommand(cmdBrightness, 2, 0.5) then
+            log(string.format("Failed to set brightness for %s", screenName), true)
             self:resetDisplayState(lunarName)
             return restoreOneScreen(index + 1)
         end
@@ -1066,7 +1097,9 @@ function obj:restoreBrightness()
                         ))
                         
                         -- Retry brightness setting
-                        pcall(hs.execute, cmdBrightness)
+                        if not self:executeLunarCommand(cmdBrightness, 2, 0.5) then
+                            log(string.format("Retry failed to set brightness for %s", screenName), true)
+                        end
                         
                         -- Second verification
                         hs.timer.doAfter(1.0, function()
@@ -1105,13 +1138,14 @@ function obj:restoreBrightness()
     
     -- Start the restore sequence
     restoreOneScreen(1)
+    self.state.restoreInProgress = false
 end
 
 -- Failsafe to make sure subzero (gamma) is disabled
 function obj:resetDisplayState(lunarName)
     log(string.format("Attempting failsafe reset for display: %s", lunarName), true)
     
-    -- First try the normal reset commands
+    -- Define reset commands
     local resetCommands = {
         string.format("%s displays \"%s\" subzero false", self.lunarPath, lunarName),
         string.format("%s displays \"%s\" gamma reset", self.lunarPath, lunarName),
@@ -1121,19 +1155,21 @@ function obj:resetDisplayState(lunarName)
     -- Execute commands sequentially with delays
     local function executeCommand(index)
         if index > #resetCommands then
+            log("Reset sequence completed")
             self.state.failedRestoreAttempts = 0
             return
         end
         
         local cmd = resetCommands[index]
         log("Executing failsafe command: " .. cmd)
-        local success, result = pcall(hs.execute, cmd)
-        if not success then
-            log(string.format("Failsafe command failed: %s", result), true)
+        
+        -- Use executeLunarCommand with increased retries and delay for reset operations
+        if not self:executeLunarCommand(cmd, 3, 1.0) then
+            log(string.format("Failsafe command failed: %s", cmd), true)
         end
         
         -- Schedule next command after delay
-        hs.timer.doAfter(0.2, function()
+        hs.timer.doAfter(0.5, function()
             executeCommand(index + 1)
         end)
     end
@@ -1327,6 +1363,39 @@ function obj:caffeineWatcherCallback(eventType)
             end
         end)
     end
+end
+
+function obj:executeLunarCommand(cmd, maxRetries, timeout)
+    maxRetries = maxRetries or 2
+    local retryDelay = timeout or 0.5
+    
+    local function attempt(retryCount)
+        local success, result = pcall(function()
+            local output, status = hs.execute(cmd)
+            if not status then
+                error("Command failed: " .. (output or "unknown error"))
+            end
+            return output
+        end)
+        
+        if success then
+            return true, result
+        end
+        
+        if retryCount < maxRetries then
+            log(string.format("Lunar command failed, retry %d/%d: %s", 
+                retryCount + 1, maxRetries, cmd))
+            hs.timer.doAfter(retryDelay, function()
+                return attempt(retryCount + 1)
+            end)
+        else
+            log(string.format("Lunar command failed after %d retries: %s", 
+                maxRetries, cmd), true)
+            return false, result
+        end
+    end
+    
+    return attempt(0)
 end
 
 function obj:checkAccessibility()
