@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.1",
+    version = "5.2",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -336,6 +336,11 @@ function obj:setupScreenWatcher()
     self.state.screenChangeDebounceInterval = 1.0  -- 1 second
 
     self.state.screenWatcher = hs.screen.watcher.new(function()
+        if self.state.isWaking then
+            log("Skipping dim reapply during wake cooldown")
+            return
+        end
+
         local now = hs.timer.secondsSinceEpoch()
         
         -- Debounce rapid screen change events
@@ -1095,6 +1100,8 @@ function obj:restoreBrightness()
             end)
         end)
     end
+
+    log(string.format("Restoring brightness for %d screens", #screens))
     
     -- Start the restore sequence
     restoreOneScreen(1)
@@ -1215,9 +1222,7 @@ function obj:resetState()
     self.state.isDimmed = false
     self.state.isRestoring = false
     self.state.isUnlocking = false
-    self.state.dimmedBeforeSleep = false
     self.state.dimmedBeforeLock = false
-    self.state.originalBrightness = {}
 end
 
 -- Caffeine watcher callback
@@ -1292,6 +1297,7 @@ function obj:caffeineWatcherCallback(eventType)
         end)
 
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
+        self:clearDisplayCache()
         self.state.lastWakeTime = now
         -- Reset *our* lastUserAction so we do NOT see an immediate idle
         self.state.lastUserAction = now
@@ -1310,8 +1316,12 @@ function obj:caffeineWatcherCallback(eventType)
             self:restoreBrightness()
         end
         
-        self:resetState()
-        hs.timer.doAfter(2, function()
+        self.state.isWaking = true
+        hs.timer.doAfter(10, function() self.state.isWaking = false end)
+
+        log("System woke from sleep. Last dim state: " .. tostring(self.state.dimmedBeforeSleep))
+
+        hs.timer.doAfter(5, function()
             if self.stateChecker then
                 self.stateChecker:start()
             end
