@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.6",
+    version = "5.7",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -962,12 +962,25 @@ end
 
 -- Restore brightness function
 function obj:restoreBrightness()
+    -- Force clear if stuck for too long
+    local now = hs.timer.secondsSinceEpoch()
+    if self.state.restoreInProgress and 
+       self.state.lastRestoreStartTime and 
+       (now - self.state.lastRestoreStartTime) > 30 then
+        log("Force-clearing stuck restore state", true)
+        self.state.restoreInProgress = false
+    end
+
     if self.state.restoreInProgress then
         log("Restore already in progress, skipping")
         return
     end
     
+    -- Start new restore
     self.state.restoreInProgress = true
+    self.state.lastRestoreStartTime = now
+    
+    log("restoreBrightness called")
     
     -- Set a safety timeout
     hs.timer.doAfter(30, function()
@@ -976,7 +989,6 @@ function obj:restoreBrightness()
             self.state.restoreInProgress = false
         end
     end)
-
     -- Bail out checks
     if self.state.failedRestoreAttempts and self.state.failedRestoreAttempts >= 2 then
         log("Multiple restore attempts failed, performing emergency reset", true)
@@ -1040,7 +1052,7 @@ function obj:restoreBrightness()
         return currentBrightness and 
                math.abs(currentBrightness - targetBrightness) <= tolerance
     end
-    
+        
     local function restoreOneScreen(index)
         if index > totalScreens then
             finalRestorationComplete()
@@ -1081,7 +1093,7 @@ function obj:restoreBrightness()
         end
         
         -- Short wait for brightness to take effect
-        hs.timer.doAfter(0.2, function()
+        hs.timer.doAfter(0.5, function()
             -- Then handle subzero state
             if originalSubzero and originalSubzero < 0 then
                 self:setSubzeroDimming(screen, originalSubzero)
@@ -1094,7 +1106,7 @@ function obj:restoreBrightness()
             end
             
             -- Verify after all changes are complete
-            hs.timer.doAfter(0.5, function()
+            hs.timer.doAfter(1.0, function()
                 if verifyScreen(screen, originalBrightness) then
                     verificationsPassed = verificationsPassed + 1
                     log(string.format("Verification passed for %s", screenName))
@@ -1329,6 +1341,9 @@ function obj:caffeineWatcherCallback(eventType)
         self.state.lastUnlockEventTime = now
         self.state.lockState = false
         
+        -- Force clear any stuck restore state
+        self.state.restoreInProgress = false
+        
         -- Stop state checker temporarily
         if self.stateChecker then 
             self.stateChecker:stop() 
@@ -1338,9 +1353,11 @@ function obj:caffeineWatcherCallback(eventType)
         self.state.lastUnlockTime = now
         self.state.lastUserAction = now
         
-        -- Restore brightness if needed
-        if self.state.isDimmed then
-            log("Restoring brightness after unlock")
+        -- Check both current dim state and wake-from-sleep state
+        if self.state.isDimmed or self.state.dimmedBeforeSleep then
+            log("Restoring brightness after unlock (dim=" .. 
+                tostring(self.state.isDimmed) .. ", beforeSleep=" .. 
+                tostring(self.state.dimmedBeforeSleep) .. ")")
             self:restoreBrightness()
         end
         
@@ -1349,7 +1366,7 @@ function obj:caffeineWatcherCallback(eventType)
             if self.stateChecker then
                 self.stateChecker:start()
             end
-        end)
+        end)    
 
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
         self:clearDisplayCache()
@@ -1371,15 +1388,6 @@ function obj:caffeineWatcherCallback(eventType)
 
         if self.stateChecker then
             self.stateChecker:stop()
-        end
-    
-        if self.state.dimmedBeforeSleep then
-            log("Woke from sleep, was dimmed, restoring brightness")
-            self:restoreBrightness(true)   -- true = force immediate restoration
-        end
-
-        if self.stateChecker then
-            self.stateChecker:start()
         end
 
         self.state.isWaking = true
