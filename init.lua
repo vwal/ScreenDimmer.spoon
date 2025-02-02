@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.5",
+    version = "5.6",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -871,7 +871,11 @@ function obj:dimScreens()
     end
 
     -- Verification pass after delay
-    hs.timer.doAfter(0.5, function()
+    local verificationDelay = self.state.isWaking and 2.0 or 0.5
+    if self.state.isWaking then
+        log("Using extended verification delay for wake scenario")
+    end
+    hs.timer.doAfter(verificationDelay, function()
         local verificationsPassed = 0
         local internalDisplayVerified = false
         
@@ -995,9 +999,34 @@ function obj:restoreBrightness()
     self.state.isRestoring = true
     
     local screens = self:sortScreensByPriority(hs.screen.allScreens())
-    local screensToVerify = #screens
+    local totalScreens = #screens
+    local completedScreens = 0
     local verificationsPassed = 0
     
+    local function finalRestorationComplete()
+        log(string.format("Restoration complete: %d/%d screens verified", 
+            verificationsPassed, totalScreens))
+        
+        -- Update state variables
+        self.state.isDimmed = false
+        self.state.dimmedBeforeLock = false
+        self.state.dimmedBeforeSleep = false
+        
+        -- Only clear original values if fully successful
+        if verificationsPassed == totalScreens then
+            log("All screens verified successfully, resetting failure counter")
+            self.state.failedRestoreAttempts = 0
+            self.state.originalBrightness = {}
+            self.state.originalSubzero = {}
+        else
+            log(string.format("Some screens failed verification (%d/%d)",
+                verificationsPassed, totalScreens), true)
+        end
+        
+        self.state.isRestoring = false
+        self.state.restoreInProgress = false
+    end
+
     local function verifyScreen(screen, targetBrightness)
         local screenName = screen:name()
         local currentBrightness = self:getHardwareBrightness(screen)
@@ -1013,27 +1042,8 @@ function obj:restoreBrightness()
     end
     
     local function restoreOneScreen(index)
-        if index > #screens then
-            -- Finished all screens
-            log(string.format("Processed all %d screens during restore", screensToVerify))
-            
-            -- Update global state
-            self.state.isDimmed = false
-            self.state.dimmedBeforeLock = false
-            self.state.dimmedBeforeSleep = false
-            
-            if verificationsPassed == screensToVerify then
-                log("All screens verified successfully, resetting failure counter")
-                self.state.failedRestoreAttempts = 0
-                self.state.originalBrightness = {}
-                self.state.originalSubzero = {}
-            else
-                log(string.format("Some screens did not verify (%d/%d)",
-                    verificationsPassed, screensToVerify), true)
-            end
-            
-            self.state.isRestoring = false
-            log("Brightness restore completed")
+        if index > totalScreens then
+            finalRestorationComplete()
             return
         end
         
@@ -1115,7 +1125,12 @@ function obj:restoreBrightness()
                                     (self.state.failedRestoreAttempts or 0) + 1
                                 self:resetDisplayState(lunarName)
                             end
-                            restoreOneScreen(index + 1)
+                            completedScreens = completedScreens + 1
+                            if completedScreens == totalScreens then
+                                finalRestorationComplete()
+                            else
+                                restoreOneScreen(index + 1)
+                            end
                         end)
                         return
                     else
@@ -1129,16 +1144,20 @@ function obj:restoreBrightness()
                         self:resetDisplayState(lunarName)
                     end
                 end
-                restoreOneScreen(index + 1)
+                completedScreens = completedScreens + 1
+                if completedScreens == totalScreens then
+                    finalRestorationComplete()
+                else
+                    restoreOneScreen(index + 1)
+                end
             end)
         end)
     end
 
-    log(string.format("Restoring brightness for %d screens", #screens))
+    log(string.format("Restoring brightness for %d screens", totalScreens))
     
     -- Start the restore sequence
     restoreOneScreen(1)
-    self.state.restoreInProgress = false
 end
 
 -- Failsafe to make sure subzero (gamma) is disabled
@@ -1334,6 +1353,13 @@ function obj:caffeineWatcherCallback(eventType)
 
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
         self:clearDisplayCache()
+        hs.timer.doAfter(0.5, function()
+            -- Pre-warm cache before restoration
+            self:getLunarDisplayNames()
+            if self.config.logging then
+                log("Pre-warmed display cache after wake")
+            end
+        end)
         self.state.lastWakeTime = now
         -- Reset *our* lastUserAction so we do NOT see an immediate idle
         self.state.lastUserAction = now
@@ -1349,11 +1375,17 @@ function obj:caffeineWatcherCallback(eventType)
     
         if self.state.dimmedBeforeSleep then
             log("Woke from sleep, was dimmed, restoring brightness")
-            self:restoreBrightness()
+            self:restoreBrightness(true)   -- true = force immediate restoration
         end
-        
+
+        if self.stateChecker then
+            self.stateChecker:start()
+        end
+
         self.state.isWaking = true
-        hs.timer.doAfter(10, function() self.state.isWaking = false end)
+        hs.timer.doAfter(3, function()
+            self.state.isWaking = false
+        end)
 
         log("System woke from sleep. Last dim state: " .. tostring(self.state.dimmedBeforeSleep))
 
@@ -1366,7 +1398,8 @@ function obj:caffeineWatcherCallback(eventType)
 end
 
 function obj:executeLunarCommand(cmd, maxRetries, timeout)
-    maxRetries = maxRetries or 2
+    maxRetries = maxRetries or (self.state.isWaking and 5 or 2)  -- More retries during wake
+    timeout = timeout or (self.state.isWaking and 0.3 or 0.5)    -- Shorter delay during wake
     local retryDelay = timeout or 0.5
     
     local function attempt(retryCount)
