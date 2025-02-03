@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.9",
+    version = "6.0",
     author = "Ville Walveranta",
     license = "MIT",
     
