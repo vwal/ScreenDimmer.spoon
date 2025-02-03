@@ -741,6 +741,7 @@ function obj:setBrightness(screen, targetValue)
     local screenName = screen:name()
     local lunarDisplays = self:getLunarDisplayNames()
     local lunarName = lunarDisplays[screenName]
+    local isInternalDisplay = screenName:match("Built%-in")
     
     if not lunarName then
         log(string.format("Display '%s' not found in Lunar display list", screenName), true)
@@ -748,15 +749,39 @@ function obj:setBrightness(screen, targetValue)
     end
 
     if targetValue < 0 then
-        -- For negative values, just set subzero dimming
-        local cmd = string.format("%s displays \"%s\" subzeroDimming %.2f", 
-            self.lunarPath, lunarName, (100 + targetValue) / 100)
-
-        if not self:executeLunarCommand(cmd) then
-            log("Failed to set brightness after retries", true)
-            return false
+        if isInternalDisplay then
+            -- Enable adaptive subzero first
+            local cmdAdaptive = string.format("%s displays \"%s\" adaptiveSubzero true", 
+                self.lunarPath, lunarName)
+            self:executeLunarCommand(cmdAdaptive)
+            hs.timer.usleep(100000)  -- 100ms wait
+            
+            -- Then set the target value
+            local targetSubzero = (100 + targetValue) / 100
+            local cmdSubzero = string.format("%s displays \"%s\" subzeroDimming %.2f", 
+                self.lunarPath, lunarName, targetSubzero)
+            if not self:executeLunarCommand(cmdSubzero) then
+                log("Failed to set subzero dimming", true)
+                return false
+            end
+            
+            log(string.format("Set subzero brightness for '%s': %.2f", 
+                screenName, targetSubzero))
+        else
+            -- For external displays, try the same approach
+            local cmdAdaptive = string.format("%s displays \"%s\" adaptiveSubzero true", 
+                self.lunarPath, lunarName)
+            self:executeLunarCommand(cmdAdaptive)
+            hs.timer.usleep(100000)  -- 100ms wait
+            
+            local targetSubzero = (100 + targetValue) / 100
+            local cmdSubzero = string.format("%s displays \"%s\" subzeroDimming %.2f", 
+                self.lunarPath, lunarName, targetSubzero)
+            if not self:executeLunarCommand(cmdSubzero) then
+                return false
+            end
         end
-
+    
         log(string.format("Set subzero brightness for '%s': %.2f", 
             screenName, (100 + targetValue) / 100))
     else
