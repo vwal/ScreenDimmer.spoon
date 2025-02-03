@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "6.0",
+    version = "6.1",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -71,10 +71,8 @@ local obj = {
         lastUnlockTime = 0,
         lastUnlockEventTime = 0,
         screenWatcher = nil,
-        unlockTimer = nil,
         isHotkeyDimming = false,
         isScreenSaverActive = false,
-        inScreenSaverRecovery = false,
         lastScreenSaverEvent = hs.timer.secondsSinceEpoch()
     }
 }
@@ -342,11 +340,16 @@ function obj:init()
         lastUnlockTime = hs.timer.secondsSinceEpoch(),
         lastUnlockEventTime = 0,
         lastHotkeyTime = 0,
-        lastRestoreTime = 0,
         failedRestoreAttempts = 0,
         lastLunarRestart = 0,
         screenWatcher = nil,
-        unlockTimer = nil
+        resetInProgress = false,
+        wakeUnlockInProgress = false,
+        lastRestoreStartTime = 0,
+        screenChangeDebounce = nil,
+        isWaking = false,
+        dimmedBeforeSleep = false,
+        originalSubzero = {}
     }
 
     -- Initialize cache settings if not set
@@ -426,75 +429,87 @@ function obj:init()
     return self
 end
 
-function obj:handleWakeUnlock(fromSleep)
-    log("Starting wake/unlock handling sequence")
-    
-    -- Kill any existing Lunar UI processes first
-    os.execute("pkill -f 'Lunar'")
-    hs.timer.usleep(500000)  -- 500ms wait
-    
-    -- Explicitly handle internal display first
-    local internalDisplay = hs.screen.find("Built%-in")
-    if internalDisplay then
-        log("Resetting internal display first")
-        local cmd = string.format("%s displays \"Built-in\" subzero false", self.lunarPath)
-        self:executeLunarCommand(cmd, 3, 0.3)  -- More retries, shorter delay
-        cmd = string.format("%s displays \"Built-in\" brightness 50", self.lunarPath)
-        self:executeLunarCommand(cmd, 3, 0.3)
+function obj:resetDisplaysAfterWake(fromSleep)
+    if self.state.resetInProgress then
+        log("Display reset already in progress, skipping")
+        return
     end
-
-    -- Then handle other displays
-    local screens = self:getCurrentScreens()
-    for _, screen in ipairs(screens) do
+    self.state.resetInProgress = true
+    
+    log("Starting display reset sequence")
+    
+    -- Set a flag to prevent concurrent operations
+    if self.state.wakeUnlockInProgress then
+        log("Wake/unlock sequence already in progress, skipping")
+        return
+    end
+    self.state.wakeUnlockInProgress = true
+    
+    -- Clear any existing restore operations
+    self.state.restoreInProgress = false
+    self.state.isRestoring = false
+    
+    -- Sequential display handling with delays
+    local function handleDisplay(screen, isInternal, callback)
         local screenName = screen:name()
-        if not screenName:match("Built%-in") then
-            local lunarName = self:getLunarDisplayNames()[screenName]
-            if lunarName then
-                local cmd = string.format("%s displays \"%s\" subzero false", self.lunarPath, lunarName)
-                self:executeLunarCommand(cmd, 2, 0.2)
-                cmd = string.format("%s displays \"%s\" brightness 50", self.lunarPath, lunarName)
-                self:executeLunarCommand(cmd, 2, 0.2)
-            end
+        local lunarName = self:getLunarDisplayNames()[screenName]
+        
+        if not lunarName then
+            log("No Lunar name found for " .. screenName)
+            callback()
+            return
         end
-    end
-
-    -- Additional stabilization for internal display
-    if internalDisplay then
-        hs.timer.doAfter(1, function()
-            self:setBrightness(internalDisplay, 75)  -- More moderate brightness
-            self:disableSubzero(internalDisplay)
+        
+        -- Reset sequence for each display
+        self:executeLunarCommand(
+            string.format("%s displays \"%s\" subzero false", self.lunarPath, lunarName),
+            3, 0.3
+        )
+        
+        hs.timer.doAfter(0.3, function()
+            self:executeLunarCommand(
+                string.format("%s displays \"%s\" brightness %d", 
+                    self.lunarPath, lunarName, isInternal and 75 or 50),
+                3, 0.3
+            )
             
-            -- Double-check internal display state
+            -- Verify after setting
             hs.timer.doAfter(0.5, function()
-                local current = self:getHardwareBrightness(internalDisplay)
+                local current = self:getHardwareBrightness(screen)
                 if not current or current < 20 then
-                    log("Internal display still dark, forcing reset", true)
-                    self:resetDisplayState("Built-in")
+                    log(string.format("%s needs recovery", screenName), true)
+                    self:resetDisplayState(lunarName)
                 end
+                callback()
             end)
         end)
     end
-
-    log("Wake/unlock sequence complete")
     
-    -- Ensure state is correct before restore
-    if fromSleep and self.state.dimmedBeforeSleep then
-        self.state.isDimmed = true
+    -- Process displays sequentially
+    local screens = self:getCurrentScreens()
+    local function processNextDisplay(index)
+        if index > #screens then
+            -- All displays processed
+            self.state.wakeUnlockInProgress = false
+            self.state.resetInProgress = false  -- Add this here
+            -- Delayed final restore
+            hs.timer.doAfter(1, function()
+                if fromSleep and self.state.dimmedBeforeSleep then
+                    self.state.isDimmed = true
+                end
+                self:restoreBrightness()
+            end)
+            return
+        end
+        
+        local screen = screens[index]
+        local isInternal = screen:name():match("Built%-in")
+        handleDisplay(screen, isInternal, function()
+            processNextDisplay(index + 1)
+        end)
     end
     
-    -- Delayed restore
-    hs.timer.doAfter(2, function()
-        self:restoreBrightness()
-    end)
-end
-
-function obj:handleSleep()
-    log("Handling sleep event")
-    -- Store dim state before sleep
-    self.state.dimmedBeforeSleep = self.state.isDimmed
-    -- Clear any stuck states
-    self.state.restoreInProgress = false
-    self.state.isRestoring = false
+    processNextDisplay(1)
 end
 
 -- Setup caffeinate watcher
@@ -509,81 +524,73 @@ end
 
 -- Setup screen watcher
 function obj:setupScreenWatcher()
+    -- Initialize state
     self.state.lastScreenChangeTime = 0
-    self.state.screenChangeDebounceInterval = 1.0  -- 1 second
+    self.state.screenChangeDebounceInterval = 1.0
+    self.state.screenChangeDebounce = nil
 
     self.state.screenWatcher = hs.screen.watcher.new(function()
-        self:invalidateCaches()
-        
-        -- Handle internal display first
-        local internalDisplay = hs.screen.find("Built%-in")
-        if internalDisplay then
-            log("Ensuring internal display state during configuration change")
-            -- Force update internal display state
-            self:executeLunarCommand(
-                string.format("%s displays \"Built-in\" subzero false", self.lunarPath),
-                3,
-                0.5
-            )
-            -- Verify state after a short delay
-            hs.timer.doAfter(0.5, function()
-                local current = self:getHardwareBrightness(internalDisplay)
-                if not current or current < 20 then
-                    log("Internal display needs recovery during config change", true)
-                    self:resetDisplayState("Built-in")
-                end
-            end)
+        -- Cancel any pending debounce
+        if self.state.screenChangeDebounce then
+            self.state.screenChangeDebounce:stop()
         end
         
-        if self.state.isWaking then
-            log("Skipping dim reapply during wake cooldown")
-            return
-        end
-
-        local now = hs.timer.secondsSinceEpoch()
-        
-        -- Debounce rapid screen change events
-        if (now - self.state.lastScreenChangeTime) < self.state.screenChangeDebounceInterval then
-            if self.config.logging then
-                log("Debouncing rapid screen configuration change")
-            end
-            return
-        end
-        
-        self.state.lastScreenChangeTime = now
-        log("Screen configuration changed", true)
-        
-        -- Clear the display mappings cache
-        self:invalidateCaches()
-        
-        -- Log current screen configuration
-        local screens = self:sortScreensByPriority(self:getCurrentScreens())
-        log(string.format("New screen configuration detected: %d display(s)", #screens))
-        for _, screen in ipairs(screens) do
-            log(string.format("- Display: %s", screen:name()))
-        end
-        
-        -- Wait a brief moment for the system to stabilize
-        hs.timer.doAfter(2, function()
-            -- If screens were dimmed, reapply dimming to all screens
-            if self.state.isDimmed then
-                log("Reapplying dim settings to new screen configuration")
-                -- Store current dim state
-                local wasDimmed = self.state.isDimmed
-                -- Reset dim state temporarily
-                self.state.isDimmed = false
-                -- Reapply dimming
-                if wasDimmed then
-                    self:dimScreens()
-                end
-            else
-                log("Screens were not dimmed, no action needed")
-            end
+        -- Create new debounce timer
+        self.state.screenChangeDebounce = hs.timer.doAfter(1.0, function()
+            self:handleScreenChange()
         end)
     end)
     
     self.state.screenWatcher:start()
     log("Screen watcher initialized and started")
+end
+
+function obj:handleScreenChange()
+    self:invalidateCaches()
+    
+    if self.state.isWaking then
+        log("Skipping screen change handling during wake cooldown")
+        return
+    end
+
+    -- Handle internal display first
+    local internalDisplay = hs.screen.find("Built%-in")
+    if internalDisplay then
+        log("Ensuring internal display state during configuration change")
+        self:executeLunarCommand(
+            string.format("%s displays \"Built-in\" subzero false", self.lunarPath),
+            3, 0.5
+        )
+        
+        -- Verify state after short delay
+        hs.timer.doAfter(0.5, function()
+            local current = self:getHardwareBrightness(internalDisplay)
+            if not current or current < 20 then
+                log("Internal display needs recovery during config change", true)
+                self:resetDisplayState("Built-in")
+            end
+        end)
+    end
+
+    -- Log configuration change
+    log("Screen configuration changed", true)
+    local screens = self:sortScreensByPriority(self:getCurrentScreens())
+    log(string.format("New screen configuration detected: %d display(s)", #screens))
+    for _, screen in ipairs(screens) do
+        log(string.format("- Display: %s", screen:name()))
+    end
+    
+    -- Reapply dimming if needed
+    hs.timer.doAfter(2, function()
+        if self.state.isDimmed then
+            log("Reapplying dim settings to new screen configuration")
+            local wasDimmed = self.state.isDimmed
+            self.state.isDimmed = false
+            if wasDimmed then
+                self:dimScreens()
+            end
+        end
+    end)
 end
 
 -- Check and update state function
@@ -1511,7 +1518,20 @@ function obj:caffeineWatcherCallback(eventType)
     log("Caffeinate event: " .. eventType, true)
     local now = hs.timer.secondsSinceEpoch()
 
-    if eventType == hs.caffeinate.watcher.screensaverDidStart then
+    if eventType == hs.caffeinate.watcher.systemWillSleep then
+        log("System preparing for sleep", true)
+        self.state.dimmedBeforeSleep = self.state.isDimmed
+        -- Clear states immediately
+        self.state.restoreInProgress = false
+        self.state.isRestoring = false
+        self.state.resetInProgress = false
+        self.state.wakeUnlockInProgress = false
+        -- Stop checker immediately
+        if self.stateChecker then
+            self.stateChecker:stop()
+        end
+
+    elseif eventType == hs.caffeinate.watcher.screensaverDidStart then
         log("Screensaver started", true)
         self.state.isScreenSaverActive = true
         self.state.lastScreenSaverEvent = now
@@ -1555,79 +1575,39 @@ function obj:caffeineWatcherCallback(eventType)
         self.state.lastUnlockEventTime = now
         self.state.lockState = false
         
-        -- Force clear any stuck restore state
-        self.state.restoreInProgress = false
+        -- Replace existing display handling with resetDisplaysAfterWake
+        self:resetDisplaysAfterWake(false)  -- false = not from sleep
         
-        -- Stop state checker temporarily
+        -- Keep the state checker management
         if self.stateChecker then 
             self.stateChecker:stop() 
         end
-        
-        -- Reset timing trackers
-        self.state.lastUnlockTime = now
-        self.state.lastUserAction = now
-        
-        -- Check both current dim state and wake-from-sleep state
-        if self.state.isDimmed or self.state.dimmedBeforeSleep then
-            log("Restoring brightness after unlock (dim=" .. 
-                tostring(self.state.isDimmed) .. ", beforeSleep=" .. 
-                tostring(self.state.dimmedBeforeSleep) .. ")")
-            self:restoreBrightness()
-        end
-        
-        -- Resume normal operation after a delay
         hs.timer.doAfter(3, function()
             if self.stateChecker then
                 self.stateChecker:start()
             end
-        end)    
-
+        end)
+    
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
         self:invalidateCaches()
         self.state.lastWakeTime = now
         self.state.lastUserAction = now
         
-        -- Special handling for internal display
-        hs.timer.doAfter(1, function()
-            local internalDisplay = hs.screen.find("Built%-in")
-            if internalDisplay then
-                log("Applying wake stabilization to internal display")
-                -- Force reset internal display state
-                self:executeLunarCommand(
-                    string.format("%s displays \"Built-in\" subzero false", self.lunarPath),
-                    3,
-                    0.5
-                )
-                self:executeLunarCommand(
-                    string.format("%s displays \"Built-in\" brightness 75", self.lunarPath),
-                    3,
-                    0.5
-                )
-                
-                -- Verify internal display state
-                hs.timer.doAfter(1, function()
-                    local current = self:getHardwareBrightness(internalDisplay)
-                    if not current or current < 20 then
-                        log("Internal display needs recovery after wake", true)
-                        self:resetDisplayState("Built-in")
-                    end
-                end)
-            end
-        end)
-    
+        -- Replace existing display handling with resetDisplaysAfterWake
+        self:resetDisplaysAfterWake(true)  -- true = from sleep
+        
+        -- Keep the wake state management
         if self.stateChecker then
             self.stateChecker:stop()
         end
-    
         self.state.isWaking = true
         hs.timer.doAfter(3, function()
             self.state.isWaking = false
-            -- Restart state checker
             if self.stateChecker then
                 self.stateChecker:start()
             end
         end)
-    
+        
         log("System woke from sleep. Last dim state: " .. tostring(self.state.dimmedBeforeSleep))
     end
 end
