@@ -417,16 +417,68 @@ function obj:init()
         log("Failed to create eventtap. Please check Accessibility permissions.", true)
     end
 
-    -- Setup caffeine watcher
-    self.caffeineWatcher = hs.caffeinate.watcher.new(function(eventType)
-        self:caffeineWatcherCallback(eventType)
-    end)
+    self:watchCaffeinate()
 
     if self.config.logging then
         log("Basic initialization complete")
     end
     
     return self
+end
+
+function obj:handleWakeUnlock(fromSleep)
+    log("Starting wake/unlock handling sequence")
+    -- Kill any existing Lunar UI processes first
+    os.execute("pkill -f 'Lunar'")
+    hs.timer.usleep(500000)  -- 500ms wait
+    
+    -- Reset all displays to normal mode
+    local screens = self:getCurrentScreens()
+    local lunarDisplays = self:getLunarDisplayNames()
+    
+    for _, screen in ipairs(screens) do
+        local screenName = screen:name()
+        local lunarName = lunarDisplays[screenName]
+        
+        if lunarName then
+            local cmd = string.format("%s displays \"%s\" subzero false", 
+                self.lunarPath, lunarName)
+            self:executeLunarCommand(cmd)
+            
+            -- Set brightness to a known good value
+            cmd = string.format("%s displays \"%s\" brightness 50", 
+                self.lunarPath, lunarName)
+            self:executeLunarCommand(cmd)
+        end
+    end
+    
+    -- Wait a bit longer before allowing dimming
+    hs.timer.usleep(1000000)  -- 1s wait
+    
+    -- Now proceed with normal wake/unlock handling
+    log("Wake/unlock sequence complete, proceeding with brightness restore")
+    if self.state.isDimmed or self.state.dimmedBeforeSleep then
+        self:restoreBrightness()
+    end
+end
+
+function obj:handleSleep()
+    log("Handling sleep event")
+    -- Store dim state before sleep
+    self.state.dimmedBeforeSleep = self.state.isDimmed
+    -- Clear any stuck states
+    self.state.restoreInProgress = false
+    self.state.isRestoring = false
+end
+
+-- Setup caffeinate watcher
+function obj:watchCaffeinate()
+    if not self.caffeineWatcher then
+        self.caffeineWatcher = hs.caffeinate.watcher.new(function(eventType)
+            self:caffeineWatcherCallback(eventType)
+        end)
+    end
+    self.caffeineWatcher:start()
 end
 
 -- Setup screen watcher
