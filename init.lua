@@ -3,12 +3,17 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "5.7",
+    version = "5.8",
     author = "Ville Walveranta",
     license = "MIT",
     
-    -- Cache the display mappings
+    -- Cache the display mappings and priorities
     displayMappings = nil,
+    cachedPrioritizedScreens = nil,
+    lastPriorityConfig = nil,
+
+    lastScreenConfig = nil,
+    lastScreenConfigTime = 0,
 
     -- Configuration
     config = {
@@ -41,7 +46,15 @@ local obj = {
         --     ["LG Ultra HD"] = 3
         -- }
         -- Default priority for displays not specified in displayPriorities
-        defaultDisplayPriority = 999
+        defaultDisplayPriority = 999,
+
+        -- Cache-related settings
+        screenCacheTimeout = 1.0,    -- How long to cache screen configurations
+        priorityCacheEnabled = true, -- Enable/disable priority caching
+        displayCacheEnabled = true,  -- Enable/disable display name caching
+        
+        -- Debug options
+        cacheDebugEnabled = false    -- Additional cache-related logging
     },
     
     -- State variables
@@ -74,11 +87,13 @@ local function log(message, force)
 end
 
 function obj:getLunarDisplayNames()
-    -- Return cached mappings if available
-    if self.displayMappings then
-        log("Returning cached display mappings:")
-        for k, v in pairs(self.displayMappings) do
-            log(string.format("  Cached mapping: %s -> %s", k, v))
+    -- Return cached mappings if enabled and available
+    if self.config.displayCacheEnabled and self.displayMappings then
+        if self.config.cacheDebugEnabled then
+            log("Returning cached display mappings:")
+            for k, v in pairs(self.displayMappings) do
+                log(string.format("  Cached mapping: %s -> %s", k, v))
+            end
         end
         return self.displayMappings
     end
@@ -142,14 +157,47 @@ function obj:getLunarDisplayNames()
         end
     end
     
-    -- Cache the mappings
-    self.displayMappings = displays
-    log("Cached new display mappings:")
-    for k, v in pairs(displays) do
-        log(string.format("  New mapping: %s -> %s", k, v))
+    -- Cache the mappings only if caching is enabled
+    if self.config.displayCacheEnabled then
+        self.displayMappings = displays
+        if self.config.cacheDebugEnabled then
+            log("Cached new display mappings:")
+            for k, v in pairs(displays) do
+                log(string.format("  New mapping: %s -> %s", k, v))
+            end
+        end
     end
     
     return displays
+end
+
+function obj:getCurrentScreens()
+    local now = hs.timer.secondsSinceEpoch()
+    
+    -- Check if cache is valid
+    local cacheValid = self.lastScreenConfig and 
+                      (now - self.lastScreenConfigTime) < self.config.screenCacheTimeout
+
+    if cacheValid and #self.lastScreenConfig > 0 then
+        if self.config.cacheDebugEnabled then
+            log("Screen cache hit - returning " .. #self.lastScreenConfig .. " screens")
+        end
+        return self.lastScreenConfig
+    end
+
+    -- Cache miss or invalid cache
+    if self.config.cacheDebugEnabled then
+        log("Screen cache miss - refreshing screen list")
+    end
+    
+    self.lastScreenConfig = hs.screen.allScreens()
+    self.lastScreenConfigTime = now
+    
+    if self.config.cacheDebugEnabled then
+        log("Cached " .. #self.lastScreenConfig .. " screens")
+    end
+    
+    return self.lastScreenConfig
 end
 
 -- Configuration parser
@@ -186,7 +234,44 @@ function obj:parseDisplayConfig(config)
 end
 
 function obj:sortScreensByPriority(screens)
-    -- If no priorities configured, return screens in original order
+    if not self.config.priorityCacheEnabled then
+        return self:sortScreensUncached(screens)
+    end
+
+    -- Safety check for screens array
+    if not screens or #screens == 0 then
+        log("No screens provided to sort", true)
+        return screens
+    end
+
+    -- Check if cache is valid
+    local cacheValid = self.cachedPrioritizedScreens and
+                      #self.cachedPrioritizedScreens == #screens and
+                      self.lastPriorityConfig == self.config.displays
+
+    if cacheValid then
+        if self.config.cacheDebugEnabled then
+            log("Using cached priority order for " .. #screens .. " screens")
+        end
+        return self.cachedPrioritizedScreens
+    end
+
+    -- Cache miss - perform sort
+    if self.config.cacheDebugEnabled then
+        log("Priority cache miss - sorting " .. #screens .. " screens")
+    end
+
+    local sortedScreens = self:sortScreensUncached(screens)
+    
+    -- Cache results
+    self.cachedPrioritizedScreens = sortedScreens
+    self.lastPriorityConfig = self.config.displays
+    
+    return sortedScreens
+end
+
+-- Helper function to do the actual sorting
+function obj:sortScreensUncached(screens)
     if not self.config.displays or not next(self.config.displays) then
         return screens
     end
@@ -264,6 +349,20 @@ function obj:init()
         unlockTimer = nil
     }
 
+    -- Initialize cache settings if not set
+    if self.config.screenCacheTimeout == nil then
+        self.config.screenCacheTimeout = 1.0
+    end
+    if self.config.priorityCacheEnabled == nil then
+        self.config.priorityCacheEnabled = true
+    end
+    if self.config.displayCacheEnabled == nil then
+        self.config.displayCacheEnabled = true
+    end
+    if self.config.cacheDebugEnabled == nil then
+        self.config.cacheDebugEnabled = false
+    end
+
     -- Setup screen watcher
     self:setupScreenWatcher()
 
@@ -336,6 +435,7 @@ function obj:setupScreenWatcher()
     self.state.screenChangeDebounceInterval = 1.0  -- 1 second
 
     self.state.screenWatcher = hs.screen.watcher.new(function()
+        self:invalidateCaches()
         if self.state.isWaking then
             log("Skipping dim reapply during wake cooldown")
             return
@@ -355,10 +455,10 @@ function obj:setupScreenWatcher()
         log("Screen configuration changed", true)
         
         -- Clear the display mappings cache
-        self:clearDisplayCache()
+        self:invalidateCaches()
         
         -- Log current screen configuration
-        local screens = hs.screen.allScreens()
+        local screens = self:sortScreensByPriority(self:getCurrentScreens())
         log(string.format("New screen configuration detected: %d display(s)", #screens))
         for _, screen in ipairs(screens) do
             log(string.format("- Display: %s", screen:name()))
@@ -416,6 +516,9 @@ end
 function obj:configure(config)
     log("Configuring variables...")
     if config then
+        -- Clear caches when configuration changes
+        self:invalidateCaches()
+
         log(".. with overriding values:")
         -- Apply all configurations except display settings
         for k, v in pairs(config) do
@@ -755,19 +858,34 @@ function obj:disableSubzero(screen)
     return self:executeLunarCommand(cmd)
 end
 
--- Clear the cache when needed
-function obj:clearDisplayCache()
+function obj:invalidateCaches()
+    if self.config.cacheDebugEnabled then
+        log("Invalidating caches:")
+        if self.displayMappings then
+            log("- Display mappings: " .. #(self.displayMappings or {}) .. " entries")
+        end
+        if self.cachedPrioritizedScreens then
+            log("- Prioritized screens: " .. #self.cachedPrioritizedScreens .. " screens")
+        end
+        if self.lastScreenConfig then
+            log("- Screen config: " .. #self.lastScreenConfig .. " screens")
+        end
+    end
+
     self.displayMappings = nil
+    self.cachedPrioritizedScreens = nil
+    self.lastPriorityConfig = nil
+    self.lastScreenConfig = nil
+    self.lastScreenConfigTime = 0
+    
+    if self.config.logging or self.config.cacheDebugEnabled then
+        log("All display caches invalidated")
+    end
 end
 
 -- Dim screens function
 function obj:dimScreens()
-    if not self.state.isEnabled then
-        log("ScreenDimmer is not enabled, skipping dim", true)
-        return
-    end
-
-    local screens = self:sortScreensByPriority(hs.screen.allScreens())
+    local screens = self:sortScreensByPriority(self:getCurrentScreens())
     if #screens == 0 then
         log("No screens available to dim", true)
         return
@@ -784,13 +902,6 @@ function obj:dimScreens()
         return
     end
     log("dimScreens called")
-
-    -- Get and validate screens
-    local screens = self:sortScreensByPriority(hs.screen.allScreens())
-    if #screens == 0 then
-        log("No screens to dim")
-        return
-    end
 
     -- Show priority order
     log("Display priority order:")
@@ -980,8 +1091,6 @@ function obj:restoreBrightness()
     self.state.restoreInProgress = true
     self.state.lastRestoreStartTime = now
     
-    log("restoreBrightness called")
-    
     -- Set a safety timeout
     hs.timer.doAfter(30, function()
         if self.state.restoreInProgress then
@@ -1010,7 +1119,7 @@ function obj:restoreBrightness()
     log("restoreBrightness called")
     self.state.isRestoring = true
     
-    local screens = self:sortScreensByPriority(hs.screen.allScreens())
+    local screens = self:sortScreensByPriority(self:getCurrentScreens())
     local totalScreens = #screens
     local completedScreens = 0
     local verificationsPassed = 0
@@ -1232,7 +1341,7 @@ function obj:emergencyReset()
     hs.timer.doAfter(2, function()
         hs.execute("open -a Lunar")
         -- Clear our display cache
-        self:clearDisplayCache()
+        self:invalidateCaches()
         hs.alert.show("🌙 Lunar restarted", 3)
     end)
 end
@@ -1369,7 +1478,7 @@ function obj:caffeineWatcherCallback(eventType)
         end)    
 
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
-        self:clearDisplayCache()
+        self:invalidateCaches()
         hs.timer.doAfter(0.5, function()
             -- Pre-warm cache before restoration
             self:getLunarDisplayNames()
