@@ -1644,38 +1644,15 @@ function obj:caffeineWatcherCallback(eventType)
 
     if eventType == hs.caffeinate.watcher.systemWillSleep then
         log("System preparing for sleep", true)
-
-    -- Store original brightness for all screens before sleep
-    self.state.preSleepBrightness = {}
-    local screens = self:getCurrentScreens()
-    for _, screen in ipairs(screens) do
-        local screenName = screen:name()
-        -- Check if we have original brightness stored (i.e., dimmer is active)
-        local originalBrightness = self.state.originalBrightness[screenName]
-        if originalBrightness then
-            self.state.preSleepBrightness[screenName] = originalBrightness
-            log(string.format("Stored pre-sleep (original) brightness for %s: %d", 
-                screenName, originalBrightness))
-        else
-            -- Fall back to current hardware brightness if not dimmed
-            local currentBrightness = self:getHardwareBrightness(screen)
-            if currentBrightness then
-                self.state.preSleepBrightness[screenName] = currentBrightness
-                log(string.format("Stored pre-sleep (current) brightness for %s: %d", 
-                    screenName, currentBrightness))
-            end
+        -- Clear states immediately
+        self.state.restoreInProgress = false
+        self.state.isRestoring = false
+        self.state.resetInProgress = false
+        self.state.wakeUnlockInProgress = false
+        -- Stop checker immediately
+        if self.stateChecker then
+            self.stateChecker:stop()
         end
-    end
-
-    -- Clear states immediately
-    self.state.restoreInProgress = false
-    self.state.isRestoring = false
-    self.state.resetInProgress = false
-    self.state.wakeUnlockInProgress = false
-    -- Stop checker immediately
-    if self.stateChecker then
-        self.stateChecker:stop()
-    end
 
     elseif eventType == hs.caffeinate.watcher.screensaverDidStart then
         log("Screensaver started", true)
