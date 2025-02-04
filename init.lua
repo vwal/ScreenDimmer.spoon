@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "7.0",
+    version = "7.1",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -1670,21 +1670,43 @@ function obj:caffeineWatcherCallback(eventType)
         self:invalidateCaches()
         self.state.lastWakeTime = now
         self.state.lastUserAction = now
-        
-        self:resetDisplaysAfterWake(true)  -- true = from sleep
-        
-        -- Keep the wake state management
+
+        -- Clear dim state if we were dimmed before sleep
+        if self.state.isDimmed then
+            log("Clearing dim state from sleep wake")
+            self.state.isDimmed = false
+            self.state.originalBrightness = {}
+            self.state.originalSubzero = {}
+        end
+
+        -- Stop the checker immediately
         if self.stateChecker then
             self.stateChecker:stop()
         end
+
+        self:resetDisplaysAfterWake(true)  -- true = from sleep
+        
         self.state.isWaking = true
+
+        -- Set up a sequence of delayed actions
         hs.timer.doAfter(3, function()
             self.state.isWaking = false
-            if self.stateChecker then
-                self.stateChecker:start()
+            
+            -- Reset user action time again after wake delay
+            self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+            
+            -- Only restart checker if we're not locked
+            if not self.state.lockState then
+                -- Add extra delay before restarting checker
+                hs.timer.doAfter(2, function()
+                    if self.stateChecker then
+                        self.stateChecker:start()
+                        -- One final reset of user action time
+                        self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+                    end
+                end)
             end
         end)
-        
         log("System woke from sleep.")
     end
 end
