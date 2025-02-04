@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "6.4",
+    version = "7.0",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -1470,16 +1470,44 @@ end
 function obj:ensureLunarRunning()
     -- Check if Lunar is running
     local output = hs.execute("pgrep -x Lunar")
+    local now = hs.timer.secondsSinceEpoch()
+    
     if output == "" then
-        log("Lunar not running, attempting to restart")
+        -- Prevent restarts more frequent than every 30 seconds
+        if (now - self.state.lastLunarRestart) < 30 then
+            log("Skipping Lunar restart - too soon since last restart", true)
+            return false
+        end
+        
+        log("Lunar not running, attempting to restart", true)
         hs.execute("open -a Lunar")
+        self.state.lastLunarRestart = now
+        
         -- Give it time to start up
         hs.timer.doAfter(5, function()
-            -- Refresh display info after restart
-            self:refreshDisplayInfo()
+            self:invalidateCaches()
+            -- Only reset displays if we still need to
+            if self.state.isDimmed then
+                self:resetDisplaysAfterWake(false)
+            end
         end)
         return false
     end
+    
+    -- Only do CLI check if we haven't successfully used it recently
+    if (now - (self.state.lastSuccessfulCLI or 0)) > 60 then
+        -- Test with a simple command
+        local testCmd = string.format("%s displays", self.lunarPath)
+        local output, status = hs.execute(testCmd)
+        
+        if status then
+            self.state.lastSuccessfulCLI = now
+        else
+            log("Lunar CLI check failed, but process is running. Waiting for recovery.", true)
+            -- Don't trigger emergency reset, just log the issue
+        end
+    end
+    
     return true
 end
 
