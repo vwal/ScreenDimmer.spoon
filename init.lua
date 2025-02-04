@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "6.3",
+    version = "6.4",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -346,7 +346,6 @@ function obj:init()
         lastRestoreStartTime = 0,
         screenChangeDebounce = nil,
         isWaking = false,
-        dimmedBeforeSleep = false,
         originalSubzero = {}
     }
 
@@ -453,7 +452,10 @@ function obj:resetDisplaysAfterWake(fromSleep)
         return
     end
     self.state.resetInProgress = true
-    
+    self.state.restoreInProgress = false
+    self.state.isRestoring = false
+    self.state.wakeUnlockInProgress = false
+
     log("Starting display reset sequence")
     
     waitForInternalDisplay(function(internalDisplay)
@@ -470,6 +472,11 @@ function obj:resetDisplaysAfterWake(fromSleep)
         
         -- Sequential display handling with delays
         function handleDisplay(screen, isInternal, callback)
+            if self.state.restoreInProgress then
+                log("Skipping display handling - restore in progress")
+                callback()
+                return
+            end
             local screenName = screen:name()
             local lunarName = self:getLunarDisplayNames()[screenName]
             
@@ -509,24 +516,33 @@ function obj:resetDisplaysAfterWake(fromSleep)
         
         -- Process displays sequentially
         local screens = self:getCurrentScreens()
+
+        -- First capture original states for all screens
+        for _, screen in ipairs(screens) do
+            local screenName = screen:name()
+            if not self.state.originalBrightness[screenName] then
+                local current = self:getHardwareBrightness(screen)
+                if current then
+                    self.state.originalBrightness[screenName] = current
+                    log(string.format("Captured original brightness for %s: %d", 
+                        screenName, current))
+                end
+            end
+        end
+
         local function processNextDisplay(index)
             if index > #screens then
                 -- All displays processed
                 self.state.wakeUnlockInProgress = false
-                self.state.resetInProgress = false  -- Add this here
-                -- Delayed final restore
-                hs.timer.doAfter(1, function()
-                    if fromSleep and self.state.dimmedBeforeSleep then
-                        log("Restoring pre-sleep dim state")
-                        self:dimScreens()
-                    else
-                        log("Restoring normal brightness")
-                        self:restoreBrightness()
-                    end
-                end)
+                self.state.resetInProgress = false
+                self.state.dimmedBeforeSleep = false  -- Reset sleep dim state
+                
+                -- Just restore to normal brightness
+                log("Restoring normal brightness after wake")
+                self:restoreBrightness()
                 return
             end
-            
+
             local screen = screens[index]
             local isInternal = screen:name():match("Built%-in")
             handleDisplay(screen, isInternal, function()
@@ -1215,7 +1231,6 @@ function obj:dimScreens()
         -- Update overall state
         if internalDisplayVerified then
             self.state.isDimmed = true
-            self.state.dimmedBeforeSleep = true
             self.state.failedRestoreAttempts = 0
             
             if verificationsPassed < #screens then
@@ -1289,7 +1304,6 @@ function obj:restoreBrightness()
         -- Update state variables
         self.state.isDimmed = false
         self.state.dimmedBeforeLock = false
-        self.state.dimmedBeforeSleep = false
         
         -- Only clear original values if fully successful
         if verificationsPassed == totalScreens then
@@ -1558,7 +1572,6 @@ function obj:caffeineWatcherCallback(eventType)
 
     if eventType == hs.caffeinate.watcher.systemWillSleep then
         log("System preparing for sleep", true)
-        self.state.dimmedBeforeSleep = self.state.isDimmed
         -- Clear states immediately
         self.state.restoreInProgress = false
         self.state.isRestoring = false
@@ -1646,7 +1659,7 @@ function obj:caffeineWatcherCallback(eventType)
             end
         end)
         
-        log("System woke from sleep. Last dim state: " .. tostring(self.state.dimmedBeforeSleep))
+        log("System woke from sleep.")
     end
 end
 
