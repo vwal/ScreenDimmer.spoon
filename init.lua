@@ -60,18 +60,36 @@ local obj = {
     -- State variables
     state = {
         originalBrightness = {},
+        preSleepBrightness = {},
+        originalSubzero = {},
         isDimmed = false,
         isEnabled = false,
         isInitialized = false,
         isRestoring = false,
-        lockState = false,
-        lastWakeTime = 0,
-        lastUserAction = 0,
-        lastUnlockTime = 0,
-        lastUnlockEventTime = 0,
-        screenWatcher = nil,
+        isWaking = false,
         isHotkeyDimming = false,
         isScreenSaverActive = false,
+        lockState = false,
+        resetInProgress = false,
+        wakeUnlockInProgress = false,
+        globalOperationInProgress = false,
+        
+        -- Timers and watchers
+        screenWatcher = nil,
+        screenChangeDebounce = nil,
+        
+        -- Operations
+        pendingOperations = {},
+        failedRestoreAttempts = 0,
+        
+        -- Timestamps
+        lastWakeTime = hs.timer.secondsSinceEpoch(),
+        lastUserAction = hs.timer.secondsSinceEpoch(),
+        lastUnlockTime = hs.timer.secondsSinceEpoch(),
+        lastUnlockEventTime = 0,
+        lastHotkeyTime = 0,
+        lastLunarRestart = 0,
+        lastRestoreStartTime = 0,
         lastScreenSaverEvent = hs.timer.secondsSinceEpoch()
     }
 }
@@ -348,7 +366,8 @@ function obj:init()
         isWaking = false,
         originalSubzero = {},
         globalOperationInProgress = false,
-        pendingOperations = {}
+        pendingOperations = {},
+        preSleepBrightness = {}
     }
 
     -- Initialize cache settings if not set
@@ -480,7 +499,7 @@ function obj:executeWakeReset()
     end
     self.pendingOperations = {}
 
-    -- Then continue with regular reset sequence
+    -- Check if reset already in progress
     if self.state.resetInProgress then
         log("Display reset already in progress, skipping")
         return
@@ -496,7 +515,6 @@ function obj:executeWakeReset()
     self.state.isDimmed = false
     
     waitForInternalDisplay(function(internalDisplay)
-        -- Simple sequential restore
         local screens = self:getCurrentScreens()
         for _, screen in ipairs(screens) do
             local screenName = screen:name()
@@ -509,10 +527,22 @@ function obj:executeWakeReset()
                         self.lunarPath, lunarName)
                 )
                 
-                -- Then set to default brightness
+                -- Use pre-sleep brightness if available, otherwise default to 50
+                local targetBrightness = 50
+                if self.state.preSleepBrightness and 
+                   self.state.preSleepBrightness[screenName] then
+                    targetBrightness = self.state.preSleepBrightness[screenName]
+                    log(string.format("Restoring pre-sleep brightness for %s: %d", 
+                        screenName, targetBrightness))
+                else
+                    log(string.format("No pre-sleep brightness found for %s, using default", 
+                        screenName))
+                end
+                
+                -- Set brightness
                 self:executeLunarCommand(
-                    string.format("%s displays \"%s\" brightness 50", 
-                        self.lunarPath, lunarName)
+                    string.format("%s displays \"%s\" brightness %d", 
+                        self.lunarPath, lunarName, targetBrightness)
                 )
             else
                 log("No Lunar name found for " .. screenName)
@@ -523,6 +553,8 @@ function obj:executeWakeReset()
         hs.timer.doAfter(2, function()
             self.state.globalOperationInProgress = false
             self.state.resetInProgress = false
+            -- Clear pre-sleep brightness after restore
+            self.state.preSleepBrightness = nil
             log("Wake reset sequence completed")
         end)
     end)
@@ -1063,6 +1095,18 @@ function obj:dimScreens()
             i, screen:name(), self.config.displayPriorities[screen:name()] or 999))
     end
 
+    -- Store pre-dim brightness for all screens
+    self.state.preSleepBrightness = {}
+    for _, screen in ipairs(screens) do
+        local screenName = screen:name()
+        local currentBrightness = self:getHardwareBrightness(screen)
+        if currentBrightness then
+            self.state.preSleepBrightness[screenName] = currentBrightness
+            log(string.format("Stored pre-dim brightness for %s: %d", 
+                screenName, currentBrightness))
+        end
+    end
+
     -- Pre-compute final levels and store original states
     local finalLevels = {}
     self.state.originalBrightness = {}
@@ -1600,15 +1644,38 @@ function obj:caffeineWatcherCallback(eventType)
 
     if eventType == hs.caffeinate.watcher.systemWillSleep then
         log("System preparing for sleep", true)
-        -- Clear states immediately
-        self.state.restoreInProgress = false
-        self.state.isRestoring = false
-        self.state.resetInProgress = false
-        self.state.wakeUnlockInProgress = false
-        -- Stop checker immediately
-        if self.stateChecker then
-            self.stateChecker:stop()
+
+    -- Store original brightness for all screens before sleep
+    self.state.preSleepBrightness = {}
+    local screens = self:getCurrentScreens()
+    for _, screen in ipairs(screens) do
+        local screenName = screen:name()
+        -- Check if we have original brightness stored (i.e., dimmer is active)
+        local originalBrightness = self.state.originalBrightness[screenName]
+        if originalBrightness then
+            self.state.preSleepBrightness[screenName] = originalBrightness
+            log(string.format("Stored pre-sleep (original) brightness for %s: %d", 
+                screenName, originalBrightness))
+        else
+            -- Fall back to current hardware brightness if not dimmed
+            local currentBrightness = self:getHardwareBrightness(screen)
+            if currentBrightness then
+                self.state.preSleepBrightness[screenName] = currentBrightness
+                log(string.format("Stored pre-sleep (current) brightness for %s: %d", 
+                    screenName, currentBrightness))
+            end
         end
+    end
+
+    -- Clear states immediately
+    self.state.restoreInProgress = false
+    self.state.isRestoring = false
+    self.state.resetInProgress = false
+    self.state.wakeUnlockInProgress = false
+    -- Stop checker immediately
+    if self.stateChecker then
+        self.stateChecker:stop()
+    end
 
     elseif eventType == hs.caffeinate.watcher.screensaverDidStart then
         log("Screensaver started", true)
@@ -1668,10 +1735,11 @@ function obj:caffeineWatcherCallback(eventType)
     
     elseif eventType == hs.caffeinate.watcher.systemDidWake then
         self:invalidateCaches()
+        local now = hs.timer.secondsSinceEpoch()
         self.state.lastWakeTime = now
         self.state.lastUserAction = now
-
-        -- Clear dim state if we were dimmed before sleep
+    
+        -- Clear dim state
         if self.state.isDimmed then
             log("Clearing dim state from sleep wake")
             self.state.isDimmed = false
@@ -1679,12 +1747,21 @@ function obj:caffeineWatcherCallback(eventType)
             self.state.originalSubzero = {}
         end
 
+        -- Use stored pre-sleep brightness values if available
+        if self.state.preSleepBrightness then
+            log("Found pre-sleep brightness values:")
+            for screen, brightness in pairs(self.state.preSleepBrightness) do
+                log(string.format("  %s: %d", screen, brightness))
+            end
+        end
+        
         -- Stop the checker immediately
         if self.stateChecker then
             self.stateChecker:stop()
         end
-
-        self:resetDisplaysAfterWake(true)  -- true = from sleep
+    
+        -- Perform display reset with saved values
+        self:resetDisplaysAfterWake(true)
         
         self.state.isWaking = true
 
