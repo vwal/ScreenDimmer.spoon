@@ -346,7 +346,9 @@ function obj:init()
         lastRestoreStartTime = 0,
         screenChangeDebounce = nil,
         isWaking = false,
-        originalSubzero = {}
+        originalSubzero = {},
+        globalOperationInProgress = false,
+        pendingOperations = {}
     }
 
     -- Initialize cache settings if not set
@@ -365,6 +367,12 @@ function obj:init()
 
     -- Setup screen watcher
     self:setupScreenWatcher()
+
+    -- Verify Lunar health
+    self.lunarHealthCheck = hs.timer.new(30, function()
+        self:ensureLunarRunning()
+    end)
+    self.lunarHealthCheck:start()
 
     -- Create state checker timer
     self.stateChecker = hs.timer.new(
@@ -446,111 +454,77 @@ local function waitForInternalDisplay(callback)
 end
 
 function obj:resetDisplaysAfterWake(fromSleep)
+    if self.state.globalOperationInProgress then
+        log("Global operation in progress, skipping wake reset")
+        return
+    end
+    self.state.globalOperationInProgress = true
+
+    -- Add longer delay for wake from sleep
+    if fromSleep then
+        log("Wake from sleep detected, adding extra delay")
+        hs.timer.doAfter(2, function()
+            self:executeWakeReset()
+        end)
+    else
+        self:executeWakeReset()
+    end
+end
+
+function obj:executeWakeReset()
+    -- Clear existing timers/operations
+    if self.pendingOperations then
+        for _, timer in pairs(self.pendingOperations) do
+            timer:stop()
+        end
+    end
+    self.pendingOperations = {}
+
     -- Then continue with regular reset sequence
     if self.state.resetInProgress then
         log("Display reset already in progress, skipping")
         return
     end
+    
+    log("Starting display reset sequence")
+    
+    -- Clear all state flags
     self.state.resetInProgress = true
     self.state.restoreInProgress = false
     self.state.isRestoring = false
     self.state.wakeUnlockInProgress = false
-
-    log("Starting display reset sequence")
+    self.state.isDimmed = false
     
     waitForInternalDisplay(function(internalDisplay)
-        -- Set a flag to prevent concurrent operations
-        if self.state.wakeUnlockInProgress then
-            log("Wake/unlock sequence already in progress, skipping")
-            return
-        end
-        self.state.wakeUnlockInProgress = true
-        
-        -- Clear any existing restore operations
-        self.state.restoreInProgress = false
-        self.state.isRestoring = false
-        
-        -- Sequential display handling with delays
-        function handleDisplay(screen, isInternal, callback)
-            if self.state.restoreInProgress then
-                log("Skipping display handling - restore in progress")
-                callback()
-                return
-            end
+        -- Simple sequential restore
+        local screens = self:getCurrentScreens()
+        for _, screen in ipairs(screens) do
             local screenName = screen:name()
             local lunarName = self:getLunarDisplayNames()[screenName]
             
-            if not lunarName then
-                log("No Lunar name found for " .. screenName)
-                callback()
-                return
-            end
-            
-            -- First disable subzero
-            self:executeLunarCommand(
-                string.format("%s displays \"%s\" subzero false", self.lunarPath, lunarName),
-                2, 0.2
-            )
-            
-            -- Then set brightness after a short delay
-            hs.timer.doAfter(0.3, function()
-                local targetBrightness = self.state.originalBrightness[screenName] or 50
-                
+            if lunarName then
+                -- First disable subzero
                 self:executeLunarCommand(
-                    string.format("%s displays \"%s\" brightness %d", 
-                        self.lunarPath, lunarName, targetBrightness),
-                    2, 0.2
+                    string.format("%s displays \"%s\" subzero false", 
+                        self.lunarPath, lunarName)
                 )
                 
-                -- Verify after setting
-                hs.timer.doAfter(0.5, function()
-                    local current = self:getHardwareBrightness(screen)
-                    if not current or current < 20 then
-                        log(string.format("%s needs recovery", screenName), true)
-                        self:resetDisplayState(lunarName)
-                    end
-                    callback()
-                end)
-            end)
-        end
-        
-        -- Process displays sequentially
-        local screens = self:getCurrentScreens()
-
-        -- First capture original states for all screens
-        for _, screen in ipairs(screens) do
-            local screenName = screen:name()
-            if not self.state.originalBrightness[screenName] then
-                local current = self:getHardwareBrightness(screen)
-                if current then
-                    self.state.originalBrightness[screenName] = current
-                    log(string.format("Captured original brightness for %s: %d", 
-                        screenName, current))
-                end
+                -- Then set to default brightness
+                self:executeLunarCommand(
+                    string.format("%s displays \"%s\" brightness 50", 
+                        self.lunarPath, lunarName)
+                )
+            else
+                log("No Lunar name found for " .. screenName)
             end
         end
 
-        local function processNextDisplay(index)
-            if index > #screens then
-                -- All displays processed
-                self.state.wakeUnlockInProgress = false
-                self.state.resetInProgress = false
-                self.state.dimmedBeforeSleep = false  -- Reset sleep dim state
-                
-                -- Just restore to normal brightness
-                log("Restoring normal brightness after wake")
-                self:restoreBrightness()
-                return
-            end
-
-            local screen = screens[index]
-            local isInternal = screen:name():match("Built%-in")
-            handleDisplay(screen, isInternal, function()
-                processNextDisplay(index + 1)
-            end)
-        end
-        
-        processNextDisplay(1)
+        -- Clear operation flags after all displays are processed
+        hs.timer.doAfter(2, function()
+            self.state.globalOperationInProgress = false
+            self.state.resetInProgress = false
+            log("Wake reset sequence completed")
+        end)
     end)
 end
 
@@ -1059,6 +1033,11 @@ end
 
 -- Dim screens function
 function obj:dimScreens()
+    if self.state.globalOperationInProgress then
+        log("Global operation in progress, skipping dim")
+        return
+    end
+
     local screens = self:sortScreensByPriority(self:getCurrentScreens())
     if #screens == 0 then
         log("No screens available to dim", true)
@@ -1246,6 +1225,11 @@ end
 
 -- Restore brightness function
 function obj:restoreBrightness()
+    if self.state.globalOperationInProgress then
+        log("Global operation in progress, skipping restore")
+        return
+    end
+
     -- Force clear if stuck for too long
     local now = hs.timer.secondsSinceEpoch()
     if self.state.restoreInProgress and 
@@ -1483,6 +1467,22 @@ function obj:resetDisplayState(lunarName)
     executeCommand(1)
 end
 
+function obj:ensureLunarRunning()
+    -- Check if Lunar is running
+    local output = hs.execute("pgrep -x Lunar")
+    if output == "" then
+        log("Lunar not running, attempting to restart")
+        hs.execute("open -a Lunar")
+        -- Give it time to start up
+        hs.timer.doAfter(5, function()
+            -- Refresh display info after restart
+            self:refreshDisplayInfo()
+        end)
+        return false
+    end
+    return true
+end
+
 function obj:emergencyReset()
     local now = hs.timer.secondsSinceEpoch()
     
@@ -1626,7 +1626,6 @@ function obj:caffeineWatcherCallback(eventType)
         self.state.lastUnlockEventTime = now
         self.state.lockState = false
         
-        -- Replace existing display handling with resetDisplaysAfterWake
         self:resetDisplaysAfterWake(false)  -- false = not from sleep
         
         -- Keep the state checker management
@@ -1644,7 +1643,6 @@ function obj:caffeineWatcherCallback(eventType)
         self.state.lastWakeTime = now
         self.state.lastUserAction = now
         
-        -- Replace existing display handling with resetDisplaysAfterWake
         self:resetDisplaysAfterWake(true)  -- true = from sleep
         
         -- Keep the wake state management
@@ -1667,7 +1665,12 @@ function obj:executeLunarCommand(cmd, maxRetries, timeout)
     maxRetries = maxRetries or (self.state.isWaking and 5 or 2)  -- More retries during wake
     timeout = timeout or (self.state.isWaking and 0.3 or 0.5)    -- Shorter delay during wake
     local retryDelay = timeout or 0.5
-    
+
+    if not self:ensureLunarRunning() then
+        log("Waiting for Lunar to restart")
+        return false
+    end    
+
     local function attempt(retryCount)
         local success, result = pcall(function()
             local output, status = hs.execute(cmd)
