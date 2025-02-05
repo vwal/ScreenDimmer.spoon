@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "7.1",
+    version = "7.2",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -59,12 +59,9 @@ local obj = {
     
     -- State variables
     state = {
-        originalBrightness = {},
-        preSleepBrightness = {},
-        originalSubzero = {},
-        isDimmed = false,
         isEnabled = false,
         isInitialized = false,
+        isDimmed = false,
         isRestoring = false,
         isWaking = false,
         isHotkeyDimming = false,
@@ -73,16 +70,21 @@ local obj = {
         resetInProgress = false,
         wakeUnlockInProgress = false,
         globalOperationInProgress = false,
-        
-        -- Timers and watchers
-        screenWatcher = nil,
-        screenChangeDebounce = nil,
-        
+    
+        -- Brightness states
+        originalBrightness = {},
+        originalSubzero = {},
+        preSleepBrightness = {},
+    
         -- Operations
         pendingOperations = {},
         failedRestoreAttempts = 0,
         
-        -- Timestamps
+        -- Timers/Watchers
+        screenWatcher = nil,
+        screenChangeDebounce = nil,
+        
+        -- Timestamps (consider initializing all with hs.timer.secondsSinceEpoch())
         lastWakeTime = hs.timer.secondsSinceEpoch(),
         lastUserAction = hs.timer.secondsSinceEpoch(),
         lastUnlockTime = hs.timer.secondsSinceEpoch(),
@@ -1630,11 +1632,15 @@ function obj:bindHotkeys(mapping)
     hs.spoons.bindHotkeysToSpec(spec, mapping)
 end
 
--- Reset state function
 function obj:resetState()
     self.state.isDimmed = false
     self.state.isRestoring = false
     self.state.dimmedBeforeLock = false
+    self.state.isHotkeyDimming = false
+    self.state.failedRestoreAttempts = 0
+    self.state.originalBrightness = {}
+    self.state.originalSubzero = {}
+    self.state.preSleepBrightness = {}
 end
 
 -- Caffeine watcher callback
