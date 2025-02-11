@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "7.2",
+    version = "7.3",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -70,6 +70,7 @@ local obj = {
         resetInProgress = false,
         wakeUnlockInProgress = false,
         globalOperationInProgress = false,
+        lunarRestartInProgress = false,
     
         -- Brightness states
         originalBrightness = {},
@@ -352,6 +353,7 @@ function obj:init()
         isEnabled = false,
         isRestoring = false,
         lockState = false,
+        lunarRestartInProgress = false,
         originalBrightness = {},
         lastWakeTime = hs.timer.secondsSinceEpoch(),
         lastUserAction = hs.timer.secondsSinceEpoch(),
@@ -1525,6 +1527,8 @@ function obj:ensureLunarRunning()
             return false
         end
         
+        -- Set restart flag
+        self.state.lunarRestartInProgress = true
         log("Lunar not running, attempting to restart", true)
         hs.execute("open -a Lunar")
         self.state.lastLunarRestart = now
@@ -1536,6 +1540,8 @@ function obj:ensureLunarRunning()
             if self.state.isDimmed then
                 self:resetDisplaysAfterWake(false)
             end
+            -- Clear restart flag
+            self.state.lunarRestartInProgress = false
         end)
         return false
     end
@@ -1721,6 +1727,7 @@ function obj:caffeineWatcherCallback(eventType)
         local now = hs.timer.secondsSinceEpoch()
         self.state.lastWakeTime = now
         self.state.lastUserAction = now
+        self.state.isWaking = true
     
         -- Clear dim state
         if self.state.isDimmed then
@@ -1743,28 +1750,37 @@ function obj:caffeineWatcherCallback(eventType)
             self.stateChecker:stop()
         end
     
-        -- Perform display reset with saved values
-        self:resetDisplaysAfterWake(true)
-        
-        self.state.isWaking = true
+        -- First ensure Lunar is running
+        if not self:ensureLunarRunning() then
+            log("Waiting for Lunar to restart after wake")
+            -- resetDisplaysAfterWake will be called by ensureLunarRunning after restart
+        else
+            -- Perform display reset with saved values if Lunar is already running
+            self:resetDisplaysAfterWake(true)
+        end
 
         -- Set up a sequence of delayed actions
         hs.timer.doAfter(3, function()
-            self.state.isWaking = false
-            
-            -- Reset user action time again after wake delay
-            self.state.lastUserAction = hs.timer.secondsSinceEpoch()
-            
-            -- Only restart checker if we're not locked
-            if not self.state.lockState then
-                -- Add extra delay before restarting checker
-                hs.timer.doAfter(2, function()
-                    if self.stateChecker then
-                        self.stateChecker:start()
-                        -- One final reset of user action time
-                        self.state.lastUserAction = hs.timer.secondsSinceEpoch()
-                    end
-                end)
+            -- Only proceed if Lunar isn't in the middle of restarting
+            if not self.state.lunarRestartInProgress then
+                self.state.isWaking = false
+                
+                -- Reset user action time again after wake delay
+                self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+                
+                -- Only restart checker if we're not locked
+                if not self.state.lockState then
+                    -- Add extra delay before restarting checker
+                    hs.timer.doAfter(2, function()
+                        if self.stateChecker then
+                            self.stateChecker:start()
+                            -- One final reset of user action time
+                            self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+                        end
+                    end)
+                end
+            else
+                log("Skipping wake sequence completion while Lunar is restarting")
             end
         end)
         log("System woke from sleep.")
