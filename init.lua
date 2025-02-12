@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "7.3",
+    version = "7.4",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -655,18 +655,32 @@ function obj:executeWakeReset()
     
     waitForInternalDisplay(function(internalDisplay)
         local screens = self:getCurrentScreens()
+        local processedScreens = {}
+        
+        -- First disable subzero on all screens
         for _, screen in ipairs(screens) do
             local screenName = screen:name()
             local lunarName = self:getLunarDisplayNames()[screenName]
             
             if lunarName then
-                -- First disable subzero
                 self:executeLunarCommand(
                     string.format("%s displays \"%s\" subzero false", 
                         self.lunarPath, lunarName)
                 )
-                
-                -- Use pre-sleep brightness if available, otherwise default to 50
+                -- Small delay between subzero commands
+                hs.timer.usleep(100000)  -- 100ms
+            end
+        end
+        
+        -- Short delay before setting brightness
+        hs.timer.usleep(300000)  -- 300ms
+        
+        -- Then set brightness on all screens
+        for _, screen in ipairs(screens) do
+            local screenName = screen:name()
+            local lunarName = self:getLunarDisplayNames()[screenName]
+            
+            if lunarName then
                 local targetBrightness = 50
                 if self.state.preSleepBrightness and 
                    self.state.preSleepBrightness[screenName] then
@@ -679,22 +693,44 @@ function obj:executeWakeReset()
                 end
                 
                 -- Set brightness
-                self:executeLunarCommand(
+                if self:executeLunarCommand(
                     string.format("%s displays \"%s\" brightness %d", 
                         self.lunarPath, lunarName, targetBrightness)
-                )
+                ) then
+                    processedScreens[screenName] = targetBrightness
+                else
+                    log(string.format("Failed to set brightness for %s", screenName), true)
+                end
+                
+                -- Small delay between brightness commands
+                hs.timer.usleep(200000)  -- 200ms
             else
                 log("No Lunar name found for " .. screenName)
             end
         end
 
-        -- Clear operation flags after all displays are processed
-        hs.timer.doAfter(2, function()
+        -- Verify brightness after all screens are processed
+        hs.timer.doAfter(1, function()
+            local allVerified = true
+            for screenName, targetBrightness in pairs(processedScreens) do
+                local screen = hs.screen.find(screenName)
+                if screen then
+                    local current = self:getHardwareBrightness(screen)
+                    if not current or math.abs(current - targetBrightness) > 10 then
+                        log(string.format("Brightness verification failed for %s: expected=%d, got=%s",
+                            screenName, targetBrightness, tostring(current)), true)
+                        allVerified = false
+                    end
+                end
+            end
+            
+            -- Clear operation flags
             self.state.globalOperationInProgress = false
             self.state.resetInProgress = false
-            -- Clear pre-sleep brightness after restore
             self.state.preSleepBrightness = nil
-            log("Wake reset sequence completed")
+            
+            log(string.format("Wake reset sequence completed (%s)", 
+                allVerified and "verified" or "with verification failures"))
         end)
     end)
 end
@@ -733,6 +769,14 @@ function obj:setupScreenWatcher()
 end
 
 function obj:handleScreenChange()
+    if self.state.globalOperationInProgress then
+        log("Deferring screen configuration change handling")
+        hs.timer.doAfter(1.0, function()
+            self:handleScreenChange()
+        end)
+        return
+    end
+
     self:invalidateCaches()
     
     if self.state.isWaking then
@@ -1987,6 +2031,31 @@ function obj:checkAccessibility()
         end)
     end
     return hs.accessibilityState()
+end
+
+function obj:handleUnlock()
+    local now = hs.timer.secondsSinceEpoch()
+    if (now - self.state.lastUnlockEventTime) < self.config.unlockDebounceInterval then
+        log("Ignoring duplicate unlock event")
+        return
+    end
+    
+    -- Set timestamp before starting operation
+    self.state.lastUnlockEventTime = now
+    
+    -- Clear any existing operations
+    if self.state.globalOperationInProgress then
+        log("Waiting for existing operation to complete")
+        -- Set up retry after short delay
+        hs.timer.doAfter(0.5, function()
+            self:handleUnlock()
+        end)
+        return
+    end
+    
+    -- Start unlock sequence
+    self.state.globalOperationInProgress = true
+    self:resetDisplaysAfterWake(false)
 end
 
 return obj
