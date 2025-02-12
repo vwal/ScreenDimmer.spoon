@@ -476,12 +476,108 @@ local function waitForInternalDisplay(callback)
     check()
 end
 
+function obj:validateState()
+    local state = self.state
+    local valid = true
+    
+    -- Check for conflicting states
+    if state.isDimmed and state.isRestoring then
+        log("Invalid state: isDimmed and isRestoring both true", true)
+        valid = false
+    end
+    
+    -- Check for stuck states
+    local now = hs.timer.secondsSinceEpoch()
+    if state.isRestoring and state.lastRestoreStartTime and 
+       (now - state.lastRestoreStartTime) > 30 then
+        log("Stuck state detected: restore operation too long", true)
+        valid = false
+    end
+    
+    -- Check for incomplete state
+    if state.isDimmed and 
+       (not state.originalBrightness or not next(state.originalBrightness)) then
+        log("Invalid state: dimmed but no original brightness stored", true)
+        valid = false
+    end
+    
+    if not valid then
+        self:resetState()
+        return false
+    end
+    return true
+end
+
+function obj:verifyDisplayState(screen, expectedValue, isSubzero)
+    local screenName = screen:name()
+    local maxAttempts = 3
+    local attempt = 1
+    local verified = false
+    
+    while attempt <= maxAttempts and not verified do
+        local current
+        if isSubzero then
+            current = self:getSubzeroDimming(screen)
+        else
+            current = self:getHardwareBrightness(screen)
+        end
+        
+        if not current then
+            log(string.format("Failed to get current state for %s (attempt %d/%d)", 
+                screenName, attempt, maxAttempts))
+            attempt = attempt + 1
+            hs.timer.usleep(300000)  -- 300ms delay between attempts
+            goto continue
+        end
+        
+        local tolerance = isSubzero and 1 or 
+                         (screenName:match("Built%-in") and 5 or 10)
+        
+        if math.abs(current - expectedValue) <= tolerance then
+            verified = true
+            log(string.format("Display state verified for %s: %d (tolerance: %d)", 
+                screenName, current, tolerance))
+            break
+        end
+        
+        log(string.format("Verification failed for %s: expected=%d, got=%d (attempt %d/%d)", 
+            screenName, expectedValue, current, attempt, maxAttempts))
+        
+        attempt = attempt + 1
+        hs.timer.usleep(500000)  -- 500ms delay between attempts
+        
+        ::continue::
+    end
+    
+    return verified
+end
+
+function obj:handleOperationFailure(operation, screen)
+    log(string.format("Operation failed: %s on %s", operation, screen:name()), true)
+    
+    -- Increment failure counter
+    self.state.failedOperations = (self.state.failedOperations or 0) + 1
+    
+    -- If too many failures, try emergency reset
+    if self.state.failedOperations >= 3 then
+        log("Too many failed operations, attempting emergency reset", true)
+        self:emergencyReset()
+        self.state.failedOperations = 0
+    end
+end
+
 function obj:resetDisplaysAfterWake(fromSleep)
     if self.state.globalOperationInProgress then
         log("Global operation in progress, skipping wake reset")
         return
     end
     self.state.globalOperationInProgress = true
+
+    if not self:validateState() then
+        log("Invalid state detected during wake, performing emergency reset")
+        self:emergencyReset()
+        return
+    end
 
     -- Add longer delay for wake from sleep
     if fromSleep then
@@ -1074,6 +1170,11 @@ function obj:dimScreens()
         return
     end
 
+    if not self:validateState() then
+        log("Invalid state detected, skipping dim operation")
+        return
+    end
+
     local screens = self:sortScreensByPriority(self:getCurrentScreens())
     if #screens == 0 then
         log("No screens available to dim", true)
@@ -1197,29 +1298,14 @@ function obj:dimScreens()
             
             if not finalLevel then goto continue end
 
-            local current
-            if finalLevel < 0 then
-                current = self:getSubzeroDimming(screen)
-            else
-                current = self:getHardwareBrightness(screen)
-            end
-
-            local tolerance = (finalLevel <= 1) and 1 or 5
-            
-            local function verifyAndLog(attempt)
-                if current and math.abs(current - finalLevel) <= tolerance then
-                    verificationsPassed = verificationsPassed + 1
-                    if screenName:match("Built%-in") then
-                        internalDisplayVerified = true
-                    end
-                    log(string.format("%s verification passed for %s", 
-                        attempt, screenName))
-                    return true
+            -- First verification attempt
+            if self:verifyDisplayState(screen, finalLevel, finalLevel < 0) then
+                verificationsPassed = verificationsPassed + 1
+                if screenName:match("Built%-in") then
+                    internalDisplayVerified = true
                 end
-                return false
-            end
-
-            if not verifyAndLog("First") then
+                log(string.format("First verification passed for %s", screenName))
+            else
                 -- For very low brightness, try one more time
                 if finalLevel <= 1 then
                     log(string.format(
@@ -1233,22 +1319,24 @@ function obj:dimScreens()
                     
                     -- Second verification after delay
                     hs.timer.doAfter(1.0, function()
-                        if finalLevel < 0 then
-                            current = self:getSubzeroDimming(screen)
+                        if self:verifyDisplayState(screen, finalLevel, finalLevel < 0) then
+                            verificationsPassed = verificationsPassed + 1
+                            if screenName:match("Built%-in") then
+                                internalDisplayVerified = true
+                            end
+                            log(string.format("Second verification passed for %s", screenName))
                         else
-                            current = self:getHardwareBrightness(screen)
-                        end
-                        
-                        if not verifyAndLog("Second") then
                             log(string.format(
-                                "Both verifications failed for %s: target=%d, current=%s", 
-                                screenName, finalLevel, tostring(current)), true)
+                                "Both verifications failed for %s: target=%d", 
+                                screenName, finalLevel), true)
+                            self:handleOperationFailure("dim", screen)
                         end
                     end)
                 else
                     log(string.format(
-                        "Verification failed for %s: target=%d, current=%s", 
-                        screenName, finalLevel, tostring(current)), true)
+                        "Verification failed for %s: target=%d", 
+                        screenName, finalLevel), true)
+                    self:handleOperationFailure("dim", screen)
                 end
             end
 
@@ -1275,6 +1363,11 @@ end
 function obj:restoreBrightness()
     if self.state.globalOperationInProgress then
         log("Global operation in progress, skipping restore")
+        return
+    end
+
+    if not self:validateState() then
+        log("Invalid state detected, skipping restore operation")
         return
     end
 
@@ -1352,32 +1445,6 @@ function obj:restoreBrightness()
         self.state.restoreInProgress = false
     end
 
-    local function verifyScreen(screen, targetBrightness)
-        local screenName = screen:name()
-        local currentBrightness = self:getHardwareBrightness(screen)
-        
-        log(string.format(
-            "Verifying %s => expected=%d, current=%s",
-            screenName, targetBrightness, tostring(currentBrightness)
-        ))
-        
-        -- Increased tolerance for external displays
-        local isInternal = screenName:match("Built%-in")
-        local tolerance = isInternal and 
-            ((targetBrightness <= 1) and 1 or 5) or  -- Internal display tolerance
-            ((targetBrightness <= 1) and 2 or 10)    -- External display tolerance
-        
-        -- Add debug logging for tolerance
-        if self.config.logging then
-            log(string.format("Using tolerance of %d for %s", 
-                tolerance, screenName))
-        end
-        
-        return currentBrightness and 
-               math.abs(currentBrightness - targetBrightness) <= tolerance
-    end
-   
-        
     local function restoreOneScreen(index)
         if index > totalScreens then
             finalRestorationComplete()
@@ -1437,7 +1504,7 @@ function obj:restoreBrightness()
             
             -- Verify after longer delay for external displays
             hs.timer.doAfter(isInternal and 0.3 or 0.8, function()
-                if verifyScreen(screen, originalBrightness) then
+                if self:verifyDisplayState(screen, originalBrightness, false) then
                     verificationsPassed = verificationsPassed + 1
                     log(string.format("Verification passed for %s", screenName))
                     completedScreens = completedScreens + 1
@@ -1452,6 +1519,7 @@ function obj:restoreBrightness()
                     else
                         log(string.format("All retries failed for %s", screenName), true)
                         self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
+                        self:handleOperationFailure("restore", screen)
                         self:resetDisplayState(lunarName)
                         completedScreens = completedScreens + 1
                         restoreOneScreen(index + 1)
@@ -1788,16 +1856,23 @@ function obj:caffeineWatcherCallback(eventType)
 end
 
 function obj:executeLunarCommand(cmd, maxRetries, timeout)
-    maxRetries = maxRetries or (self.state.isWaking and 5 or 2)  -- More retries during wake
-    timeout = timeout or (self.state.isWaking and 0.3 or 0.5)    -- Shorter delay during wake
-    local retryDelay = timeout or 0.5
+    -- Add absolute timeout for commands
+    local startTime = hs.timer.secondsSinceEpoch()
+    local absoluteTimeout = 5.0  -- 5 seconds max for any command
+    
+    local function isTimedOut()
+        return (hs.timer.secondsSinceEpoch() - startTime) > absoluteTimeout
+    end
 
-    if not self:ensureLunarRunning() then
-        log("Waiting for Lunar to restart")
-        return false
-    end    
+    maxRetries = maxRetries or (self.state.isWaking and 5 or 2)
+    timeout = timeout or (self.state.isWaking and 0.3 or 0.5)
 
     local function attempt(retryCount)
+        if isTimedOut() then
+            log("Command timed out after " .. absoluteTimeout .. " seconds: " .. cmd, true)
+            return false
+        end
+
         local success, result = pcall(function()
             local output, status = hs.execute(cmd)
             if not status then
@@ -1806,21 +1881,16 @@ function obj:executeLunarCommand(cmd, maxRetries, timeout)
             return output
         end)
         
-        if success then
-            return true, result
-        end
+        if success then return true, result end
         
-        if retryCount < maxRetries then
+        if retryCount < maxRetries and not isTimedOut() then
             log(string.format("Lunar command failed, retry %d/%d: %s", 
                 retryCount + 1, maxRetries, cmd))
-            hs.timer.doAfter(retryDelay, function()
-                return attempt(retryCount + 1)
-            end)
-        else
-            log(string.format("Lunar command failed after %d retries: %s", 
-                maxRetries, cmd), true)
-            return false, result
+            hs.timer.usleep(timeout * 1000000)  -- Convert to microseconds
+            return attempt(retryCount + 1)
         end
+        
+        return false, result
     end
     
     return attempt(0)
