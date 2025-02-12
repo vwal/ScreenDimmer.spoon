@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "7.4",
+    version = "7.5",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -84,6 +84,7 @@ local obj = {
         -- Timers/Watchers
         screenWatcher = nil,
         screenChangeDebounce = nil,
+        activeTimers = {},
         
         -- Timestamps (consider initializing all with hs.timer.secondsSinceEpoch())
         lastWakeTime = hs.timer.secondsSinceEpoch(),
@@ -102,6 +103,76 @@ local function log(message, force)
     if force or obj.config.logging then
         print(os.date("%Y-%m-%d %H:%M:%S: ") .. message)
     end
+end
+
+-- Core timer management functions
+function obj:createTimer(delay, callback, description)
+    if not self.state.activeTimers then self.state.activeTimers = {} end
+    
+    -- Create timer reference first
+    local timerRef
+    
+    local wrappedCallback = function()
+        -- Remove from active timers before executing
+        if timerRef then
+            self.state.activeTimers[timerRef] = nil
+        end
+        
+        local ok, err = pcall(function()
+            callback(self)
+        end)
+        
+        if not ok then
+            log(string.format("Timer error (%s): %s", 
+                description or "unnamed", 
+                tostring(err)), true)
+        end
+    end
+    
+    -- Now create the actual timer
+    timerRef = hs.timer.doAfter(delay, wrappedCallback)
+    
+    -- Store in active timers
+    self.state.activeTimers[timerRef] = {
+        description = description or "unnamed timer",
+        created = hs.timer.secondsSinceEpoch(),
+        delay = delay
+    }
+    
+    if self.config.debug then
+        log("Created timer: " .. description)
+    end
+    
+    return timerRef
+end
+
+function obj:clearTimers(filter)
+    if not self.state.activeTimers then return end
+    
+    local count = 0
+    for timer, info in pairs(self.state.activeTimers) do
+        if not filter or filter(info) then
+            if timer and timer.stop then
+                timer:stop()
+                self.state.activeTimers[timer] = nil
+                count = count + 1
+                if self.config.debug then
+                    log("Stopped timer: " .. info.description)
+                end
+            end
+        end
+    end
+    
+    if count > 0 and self.config.debug then
+        log(string.format("Cleared %d timers", count))
+    end
+end
+
+function obj:cleanupStaleTimers()
+    local now = hs.timer.secondsSinceEpoch()
+    self:clearTimers(function(info)
+        return (now - info.created) > (info.delay * 2)
+    end)
 end
 
 function obj:getLunarDisplayNames()
@@ -385,8 +456,11 @@ function obj:init()
         return self
     end
 
+    self.state = self.state or {}
+
     -- Initialize basic state
     self.state = {
+        activeTimers = {},
         isInitialized = false,  -- Will be set to true after successful configuration
         isDimmed = false,
         isEnabled = false,
@@ -606,6 +680,11 @@ function obj:handleOperationFailure(operation, screen)
 end
 
 function obj:resetDisplaysAfterWake(fromSleep)
+    -- Clear any existing wake/restore timers
+    self:clearTimers(function(info)
+        return info.description:match("^wake") or info.description:match("^restore")
+    end)
+
     if self.state.globalOperationInProgress then
         log("Global operation in progress, skipping wake reset")
         return
@@ -621,11 +700,13 @@ function obj:resetDisplaysAfterWake(fromSleep)
     -- Add longer delay for wake from sleep
     if fromSleep then
         log("Wake from sleep detected, adding extra delay")
-        hs.timer.doAfter(2, function()
+        self:createTimer(2.0, function(self)
             self:executeWakeReset()
-        end)
+        end, "wake reset delayed")
     else
-        self:executeWakeReset()
+        self:createTimer(0.5, function(self)
+            self:executeWakeReset()
+        end, "wake reset immediate")
     end
 end
 
@@ -776,6 +857,8 @@ function obj:handleScreenChange()
         end)
         return
     end
+
+    self:cleanupStaleTimers()
 
     self:invalidateCaches()
     
@@ -1024,6 +1107,9 @@ function obj:stop(showAlert)
 
     log("Stopping ScreenDimmer", true)
     self.state.isEnabled = false
+
+    -- Clear all timers
+    self:clearTimers()
 
     -- Stop all watchers
     if self.stateChecker then
@@ -1509,6 +1595,7 @@ function obj:restoreBrightness()
             self.state.restoreInProgress = false
         end
     end)
+
     -- Bail out checks
     if self.state.failedRestoreAttempts and self.state.failedRestoreAttempts >= 2 then
         log("Multiple restore attempts failed, performing emergency reset", true)
@@ -1529,124 +1616,122 @@ function obj:restoreBrightness()
     
     log("restoreBrightness called")
     self.state.isRestoring = true
-    
+
     local screens = self:sortScreensByPriority(self:getCurrentScreens())
     local totalScreens = #screens
-    local completedScreens = 0
-    local verificationsPassed = 0
     
-    local function finalRestorationComplete()
-        log(string.format("Restoration complete: %d/%d screens verified", 
-            verificationsPassed, totalScreens))
-        
-        -- Update state variables
-        self.state.isDimmed = false
-        self.state.dimmedBeforeLock = false
-        
-        -- Only clear original values if fully successful
-        if verificationsPassed == totalScreens then
-            log("All screens verified successfully, resetting failure counter")
-            self.state.failedRestoreAttempts = 0
-            self.state.originalBrightness = {}
-            self.state.originalSubzero = {}
-        else
-            log(string.format("Some screens failed verification (%d/%d)",
-                verificationsPassed, totalScreens), true)
-        end
-        
-        self.state.isRestoring = false
-        self.state.restoreInProgress = false
-    end
-
-    local function restoreOneScreen(index)
-        if index > totalScreens then
-            finalRestorationComplete()
-            return
-        end
-        
-        local screen = screens[index]
-        local screenName = screen:name()
-        local lunarName = self:getLunarDisplayNames()[screenName]
-        local originalBrightness = self.state.originalBrightness[screenName]
-        local originalSubzero = self.state.originalSubzero[screenName]
-        local isInternal = screenName:match("Built%-in")
-        local retryAttempts = 0
-        local maxRetries = isInternal and 1 or 3  -- More retries for external displays
-        
-        -- Skip if missing data
-        if not (lunarName and originalBrightness) then
-            log(string.format(
-                "No stored brightness or missing Lunar name for %s; skipping restore", 
-                screenName
-            ))
-            restoreOneScreen(index + 1)
-            return
-        end
-        
-        local function attemptRestore()
-            log(string.format(
-                "Restoring %s => brightness=%d, subzero=%s (attempt %d/%d)",
-                screenName, originalBrightness, tostring(originalSubzero),
-                retryAttempts + 1, maxRetries
-            ))
-            
-            -- First disable subzero if needed
-            if originalSubzero and originalSubzero < 0 then
-                self:disableSubzero(screen)
-                hs.timer.usleep(300000)  -- 300ms wait after subzero change
-            end
-            
-            -- Then set the hardware brightness
-            local cmdBrightness = string.format(
-                "%s displays \"%s\" brightness %d", 
-                self.lunarPath, lunarName, originalBrightness
-            )
-            log("Executing: " .. cmdBrightness)
-            
-            if not self:executeLunarCommand(cmdBrightness, 2, 0.3) then
-                log(string.format("Failed to set brightness for %s", screenName), true)
-                if retryAttempts < maxRetries - 1 then
-                    retryAttempts = retryAttempts + 1
-                    hs.timer.doAfter(0.5, attemptRestore)
-                else
-                    self:resetDisplayState(lunarName)
-                    restoreOneScreen(index + 1)
-                end
-                return
-            end
-            
-            -- Verify after longer delay for external displays
-            hs.timer.doAfter(isInternal and 0.3 or 0.8, function()
-                if self:verifyDisplayState(screen, originalBrightness, false) then
-                    verificationsPassed = verificationsPassed + 1
-                    log(string.format("Verification passed for %s", screenName))
-                    completedScreens = completedScreens + 1
-                    restoreOneScreen(index + 1)
-                else
-                    if retryAttempts < maxRetries - 1 then
-                        retryAttempts = retryAttempts + 1
-                        log(string.format(
-                            "Verification failed, retry %d/%d for %s", 
-                            retryAttempts + 1, maxRetries, screenName))
-                        hs.timer.doAfter(0.5, attemptRestore)
-                    else
-                        log(string.format("All retries failed for %s", screenName), true)
-                        self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
-                        self:handleOperationFailure("restore", screen)
-                        self:resetDisplayState(lunarName)
-                        completedScreens = completedScreens + 1
-                        restoreOneScreen(index + 1)
-                    end
-                end
-            end)
-        end
-        attemptRestore()
-    end
-
     log(string.format("Restoring brightness for %d screens", totalScreens))
     
     -- Start the restore sequence
-    restoreOneScreen(1)
+    self:restoreOneScreen(1, totalScreens, 0, 0)
+end
+
+function obj:restoreOneScreen(index, totalScreens, completedScreens, verificationsPassed)
+    local screens = self:sortScreensByPriority(self:getCurrentScreens())
+    if index > #screens then
+        log("Restore sequence complete")
+        self:finalizeRestore(verificationsPassed, totalScreens)
+        return
+    end
+
+    local screen = screens[index]
+    local screenName = screen:name()
+    local lunarName = self:getLunarDisplayNames()[screenName]
+    local originalBrightness = self.state.originalBrightness[screenName]
+    local originalSubzero = self.state.originalSubzero[screenName]
+    local isInternal = screenName:match("Built%-in")
+    local retryAttempts = 0
+    local maxRetries = isInternal and 1 or 3  -- More retries for external displays
+    
+    -- Skip if missing data
+    if not (lunarName and originalBrightness) then
+        log(string.format(
+            "No stored brightness or missing Lunar name for %s; skipping restore", 
+            screenName
+        ))
+        self:restoreOneScreen(index + 1, totalScreens, completedScreens, verificationsPassed)
+        return
+    end
+    
+    local function attemptRestore()
+        log(string.format(
+            "Restoring %s => brightness=%d, subzero=%s (attempt %d/%d)",
+            screenName, originalBrightness, tostring(originalSubzero),
+            retryAttempts + 1, maxRetries
+        ))
+        
+        -- First disable subzero if needed
+        if originalSubzero and originalSubzero < 0 then
+            self:disableSubzero(screen)
+            hs.timer.usleep(300000)  -- 300ms wait after subzero change
+        end
+        
+        -- Then set the hardware brightness
+        local cmdBrightness = string.format(
+            "%s displays \"%s\" brightness %d", 
+            self.lunarPath, lunarName, originalBrightness
+        )
+        log("Executing: " .. cmdBrightness)
+        
+        if not self:executeLunarCommand(cmdBrightness, 2, 0.3) then
+            log(string.format("Failed to set brightness for %s", screenName), true)
+            if retryAttempts < maxRetries - 1 then
+                retryAttempts = retryAttempts + 1
+                self:createTimer(0.5, function(self)
+                    attemptRestore()
+                end, string.format("brightness retry %d for %s", retryAttempts + 1, screenName))
+            else
+                self:resetDisplayState(lunarName)
+                self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed)
+            end
+            return
+        end
+        
+        self:createTimer(isInternal and 0.3 or 0.8, function(self)
+            if self:verifyDisplayState(screen, originalBrightness, false) then
+                log(string.format("Verification passed for %s", screenName))
+                self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed + 1)
+            else
+                if retryAttempts < maxRetries - 1 then
+                    retryAttempts = retryAttempts + 1
+                    self:createTimer(0.5, function(self)
+                        attemptRestore()
+                    end, string.format("restore retry %d for %s", retryAttempts + 1, screenName))
+                else
+                    log(string.format("All retries failed for %s", screenName), true)
+                    self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
+                    self:handleOperationFailure("restore", screen)
+                    self:resetDisplayState(lunarName)
+                    self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed)
+                end
+            end
+        end, string.format("verify restore for %s", screenName))
+    end
+
+    attemptRestore()
+end
+
+function obj:finalizeRestore(verificationsPassed, totalScreens)
+    log(string.format("Restoration complete: %d/%d screens verified", 
+        verificationsPassed, totalScreens))
+    
+    -- Update state variables
+    self.state.isDimmed = false
+    self.state.dimmedBeforeLock = false
+    
+    -- Only clear original values if fully successful
+    if verificationsPassed == totalScreens then
+        log("All screens verified successfully, resetting failure counter")
+        self.state.failedRestoreAttempts = 0
+        self.state.originalBrightness = {}
+        self.state.originalSubzero = {}
+    else
+        log(string.format("Some screens failed verification (%d/%d)",
+            verificationsPassed, totalScreens), true)
+    end
+    
+    self.state.isRestoring = false
+    self.state.restoreInProgress = false
 end
 
 -- Failsafe to make sure subzero (gamma) is disabled
