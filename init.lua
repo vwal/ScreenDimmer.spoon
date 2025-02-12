@@ -251,9 +251,48 @@ function obj:parseDisplayConfig(config)
     return displays
 end
 
+function obj:computeConfigHash(displays)
+    if not displays then return "" end
+    
+    local parts = {}
+    local keys = {}
+    
+    -- Get sorted keys for consistent ordering
+    for k in pairs(displays) do
+        table.insert(keys, k)
+    end
+    table.sort(keys)
+    
+    -- Build hash string
+    for _, k in ipairs(keys) do
+        local v = displays[k]
+        table.insert(parts, string.format("%s:%d:%s",
+            k,
+            v.priority or 999,
+            tostring(v.dimLevel or "default")
+        ))
+    end
+    
+    return table.concat(parts, "|")
+end
+
 function obj:sortScreensByPriority(screens)
     if not self.config.priorityCacheEnabled then
         return self:sortScreensUncached(screens)
+    end
+
+    local currentHash = self:computeConfigHash(self.config.displays)
+    
+    -- Check if cache is valid using hash
+    local cacheValid = self.cachedPrioritizedScreens and
+                      #self.cachedPrioritizedScreens == #screens and
+                      self.lastPriorityConfig == currentHash
+
+    if cacheValid then
+        if self.config.cacheDebugEnabled then
+            log("Using cached priority order for " .. #screens .. " screens")
+        end
+        return self.cachedPrioritizedScreens
     end
 
     -- Safety check for screens array
@@ -281,9 +320,9 @@ function obj:sortScreensByPriority(screens)
 
     local sortedScreens = self:sortScreensUncached(screens)
     
-    -- Cache results
+    -- Store hash when caching
+    self.lastPriorityConfig = currentHash
     self.cachedPrioritizedScreens = sortedScreens
-    self.lastPriorityConfig = self.config.displays
     
     return sortedScreens
 end
@@ -864,7 +903,37 @@ function obj:start(showAlert)
                     hs.eventtap.event.types.rightMouseDown,
                     hs.eventtap.event.types.mouseMoved
                 }, function(event)
-                    -- ... event handling code ...
+                    if self.state.lockState or self.state.isRestoring then
+                        return false
+                    end
+
+                    local now = hs.timer.secondsSinceEpoch()
+
+                    -- Add safety check for lastScreenSaverEvent
+                    local screenSaverCooldown = (self.state.lastScreenSaverEvent and 
+                        (now - self.state.lastScreenSaverEvent) < 3.0)
+
+                    -- Strict ignore period after hotkey or screen events
+                    if (now - self.state.lastHotkeyTime) < 2.0 or screenSaverCooldown then
+                        if self.config.logging then
+                            log("Ignoring user activity during cooldown period")
+                        end
+                        return false
+                    end
+
+                    -- Only process events if enough time has passed since last action
+                    if (now - self.state.lastUserAction) > 0.1 then
+                        self.state.lastUserAction = now
+
+                        if self.state.isDimmed and not self.state.isHotkeyDimming then
+                            if self.config.logging then
+                                log("User action while dimmed, restoring brightness")
+                            end
+                            self:restoreBrightness()
+                        end
+                    end
+                    
+                    return false
                 end)
                 
                 hs.timer.doAfter(retryDelay, startWatcher)
@@ -1211,7 +1280,7 @@ function obj:dimScreens()
                 screenName, currentBrightness))
         end
     end
-
+    
     -- Pre-compute final levels and store original states
     local finalLevels = {}
     self.state.originalBrightness = {}
