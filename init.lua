@@ -291,23 +291,6 @@ function obj:getLunarDisplayIdentifier(screen)
     return displayInfo.serial or displayInfo.name
 end
 
-local function getLunarName(screen, uniqueName)
-    local lunarDisplays = self:getLunarDisplayNames()
-    local displayInfo = lunarDisplays[uniqueName]
-    
-    -- Try without sequence numbers if not found
-    if not displayInfo then
-        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
-    end
-    
-    -- Try special case for Built-in
-    if not displayInfo and uniqueName:match("Built%-in") then
-        displayInfo = lunarDisplays["Built-in"]
-    end
-
-    return displayInfo and (displayInfo.serial or displayInfo.name)
-end
-
 function obj:getCurrentScreens()
     local now = hs.timer.secondsSinceEpoch()
     
@@ -552,33 +535,6 @@ function obj:display(priority, dimLevel)
         priority = priority,
         dimLevel = dimLevel
     }
-end
-
-function obj:getDisplayIdentifier(screen)
-    local uniqueName = self:getUniqueNameForScreen(screen)
-    local lunarDisplays = self:getLunarDisplayNames()
-    local displayInfo = nil
-
-    -- First try exact match
-    displayInfo = lunarDisplays[uniqueName]
-
-    -- If not found and it's a UUID, try direct UUID lookup
-    if not displayInfo and uniqueName:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
-        return uniqueName
-    end
-
-    -- If still not found, try matching without sequence numbers
-    if not displayInfo then
-        local baseEdid = uniqueName:gsub("%s*%([%d]+%)", "")
-        displayInfo = lunarDisplays[baseEdid]
-    end
-
-    -- Special case for Built-in display
-    if not displayInfo and uniqueName:match("Built%-in") then
-        displayInfo = lunarDisplays["Built-in"]
-    end
-
-    return displayInfo and displayInfo.serial or nil
 end
 
 -- Initialize ScreenDimmer
@@ -2357,31 +2313,6 @@ function obj:checkAccessibility()
         end)
     end
     return hs.accessibilityState()
-end
-
-function obj:handleUnlock()
-    local now = hs.timer.secondsSinceEpoch()
-    if (now - self.state.lastUnlockEventTime) < self.config.unlockDebounceInterval then
-        log("Ignoring duplicate unlock event")
-        return
-    end
-    
-    -- Set timestamp before starting operation
-    self.state.lastUnlockEventTime = now
-    
-    -- Clear any existing operations
-    if self.state.globalOperationInProgress then
-        log("Waiting for existing operation to complete")
-        -- Set up retry after short delay
-        hs.timer.doAfter(0.5, function()
-            self:handleUnlock()
-        end)
-        return
-    end
-    
-    -- Start unlock sequence
-    self.state.globalOperationInProgress = true
-    self:resetDisplaysAfterWake(false)
 end
 
 return obj
