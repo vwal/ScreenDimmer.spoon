@@ -665,7 +665,8 @@ function obj:init()
         hs.eventtap.event.types.flagsChanged,
         hs.eventtap.event.types.leftMouseDown,
         hs.eventtap.event.types.rightMouseDown,
-        hs.eventtap.event.types.mouseMoved
+        hs.eventtap.event.types.mouseMoved,
+        hs.eventtap.event.types.scrollWheel
     }, function(event)
         if self.state.lockState or self.state.isRestoring then
             return false
