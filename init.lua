@@ -176,88 +176,131 @@ function obj:cleanupStaleTimers()
 end
 
 function obj:getLunarDisplayNames()
-    -- Return cached mappings if enabled and available
     if self.config.displayCacheEnabled and self.displayMappings then
-        if self.config.cacheDebugEnabled then
-            log("Returning cached display mappings:")
-            for k, v in pairs(self.displayMappings) do
-                log(string.format("  Cached mapping: %s -> %s", k, v))
-            end
-        end
         return self.displayMappings
     end
    
-    local command = string.format("%s displays", self.lunarPath)
-    log("Executing Lunar command: " .. command)
-    local output, status = hs.execute(command)
+    local maxRetries = 3
+    local retryDelay = 0.5
     
-    if not status then
-        log("Failed to get display list from Lunar", true)
-        return {}
-    end
-
-    log("Raw Lunar output:\n" .. output)
-
-    local displays = {}
-    local currentDisplay = nil
-    local currentEDIDName = nil
-    
-    for line in output:gmatch("[^\r\n]+") do
-        -- Match the display header line (e.g., "0: Built-in")
-        local num, name = line:match("^(%d+):%s+(.+)$")
-        -- Or match the EDID Name line
-        local edidName = line:match("^%s*EDID Name:%s+(.+)$")
+    for attempt = 1, maxRetries do
+        local command = string.format("%s displays", self.lunarPath)
+        local output, status = hs.execute(command)
         
-        if num and name then
-            currentDisplay = name
-            currentEDIDName = nil
-            -- Add direct mapping
-            displays[name] = name
+        if status then
+            local displays = {}
+            local currentDisplay = nil
+            local currentEdid = nil
+            local currentSerial = nil
             
-            -- Special case for Built-in display
-            if name == "Built-in" then
-                displays["Built-in Retina Display"] = "Built-in"
-            end
-            
-            log(string.format("Added primary mapping: %s -> %s", name, name))
-            
-        elseif edidName and currentDisplay then
-            currentEDIDName = edidName
-            -- Add EDID mapping if different from current display name
-            if edidName ~= currentDisplay then
-                displays[edidName] = currentDisplay
-                log(string.format("Added EDID mapping: %s -> %s", edidName, currentDisplay))
-            end
-            
-            -- Try variations of the name
-            local variations = {
-                edidName,
-                edidName:gsub(" ", ""),  -- Remove spaces
-                edidName:gsub("%-", " "), -- Replace hyphens with spaces
-                edidName:gsub(" ", "-")   -- Replace spaces with hyphens
-            }
-            
-            for _, variant in ipairs(variations) do
-                if variant ~= currentDisplay and variant ~= edidName then
-                    displays[variant] = currentDisplay
-                    log(string.format("Added variant mapping: %s -> %s", variant, currentDisplay))
+            for line in output:gmatch("[^\r\n]+") do
+                local num, name = line:match("^(%d+):%s+(.+)$")
+                local edid = line:match("^%s*EDID Name:%s+(.+)$")
+                local serial = line:match("^%s*Serial:%s+(.+)$")
+                
+                if num and name then
+                    currentDisplay = name
+                elseif edid then
+                    -- Strip the sequential numbers like (1), (2) from EDID
+                    currentEdid = edid:gsub("%s*%([%d]+%)", "")
+                elseif serial then
+                    currentSerial = serial
+                    
+                    -- Create display info
+                    local info = {
+                        name = currentDisplay,
+                        edid = currentEdid,
+                        serial = currentSerial
+                    }
+                    
+                    -- Store by full name and serial
+                    displays[currentDisplay] = info
+                    displays[currentSerial] = info
+                    
+                    -- Handle Built-in display special cases
+                    if currentDisplay == "Built-in" then
+                        displays["Built-in Retina Display"] = info
+                        displays["Built-in"] = info
+                    end
+                    
+                    -- Store base EDID name (without sequence numbers)
+                    local baseEdid = currentDisplay:gsub("%s*%([%d]+%)", "")
+                    if not displays[baseEdid] then
+                        displays[baseEdid] = info
+                    end
+                    
+                    log(string.format("Mapped display: %s (EDID: %s) -> serial: %s", 
+                        currentDisplay, currentEdid, currentSerial))
                 end
             end
-        end
-    end
-    
-    -- Cache the mappings only if caching is enabled
-    if self.config.displayCacheEnabled then
-        self.displayMappings = displays
-        if self.config.cacheDebugEnabled then
-            log("Cached new display mappings:")
-            for k, v in pairs(displays) do
-                log(string.format("  New mapping: %s -> %s", k, v))
+            
+            if next(displays) then  -- Check if we got any displays
+                if self.config.displayCacheEnabled then
+                    self.displayMappings = displays
+                end
+                return displays
+            else
+                log(string.format("Got empty display list from Lunar (attempt %d/%d)", 
+                    attempt, maxRetries))
             end
+        else
+            log(string.format("Failed to get display list from Lunar (attempt %d/%d)", 
+                attempt, maxRetries))
+        end
+        
+        if attempt < maxRetries then
+            log(string.format("Waiting %.1f seconds before retry...", retryDelay))
+            hs.timer.usleep(retryDelay * 1000000)
         end
     end
     
-    return displays
+    log("All attempts to get Lunar display list failed", true)
+    return {}
+end
+
+function obj:getLunarDisplayIdentifier(screen)
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local lunarDisplays = self:getLunarDisplayNames()
+    local displayInfo = nil
+
+    -- First try exact match
+    displayInfo = lunarDisplays[uniqueName]
+
+    -- If not found and it's a UUID, try direct UUID lookup
+    if not displayInfo and screen:getUUID() then
+        displayInfo = lunarDisplays[screen:getUUID()]
+    end
+
+    -- If still not found, try matching without sequence numbers
+    if not displayInfo then
+        local baseEdid = uniqueName:gsub("%s*%([%d]+%)", "")
+        displayInfo = lunarDisplays[baseEdid]
+    end
+
+    -- Special case for Built-in display
+    if not displayInfo and uniqueName:match("Built%-in") then
+        displayInfo = lunarDisplays["Built-in"]
+    end
+
+    -- Return the serial or name, with name as fallback
+    return displayInfo and (displayInfo.serial or displayInfo.name) or uniqueName
+end
+
+local function getLunarName(screen, uniqueName)
+    local lunarDisplays = self:getLunarDisplayNames()
+    local displayInfo = lunarDisplays[uniqueName]
+    
+    -- Try without sequence numbers if not found
+    if not displayInfo then
+        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
+    end
+    
+    -- Try special case for Built-in
+    if not displayInfo and uniqueName:match("Built%-in") then
+        displayInfo = lunarDisplays["Built-in"]
+    end
+
+    return displayInfo and (displayInfo.serial or displayInfo.name)
 end
 
 function obj:getCurrentScreens()
@@ -289,32 +332,101 @@ function obj:getCurrentScreens()
     return self.lastScreenConfig
 end
 
--- Configuration parser
+function obj:getUniqueNameForScreen(screen)
+    -- First try to get UUID/serial from screen
+    local id = screen:getUUID() or screen:id()
+    if id then
+        log(string.format("Screen UUID/ID: %s", id))
+        -- Check if this ID matches any of our configured UUIDs
+        for name, settings in pairs(self.config.displays or {}) do
+            log(string.format("Checking against configured display: %s", name))
+            if name:match("^%x%x%x%x%x%x%x%x%-") and name == id then
+                log(string.format("Found UUID match: %s", id))
+                return id
+            end
+        end
+    else
+        log("No UUID/ID found for screen")
+    end
+
+    -- Fall back to name-based identification
+    local base = screen:name()
+    log(string.format("Falling back to name-based identification: %s", base))
+    local count = 0
+    for _, s in ipairs(self:getCurrentScreens()) do
+        if s:name() == base then
+            count = count + 1
+            if s == screen then break end
+        end
+    end
+    if count > 1 then
+        local result = base .. " (" .. count .. ")"
+        log(string.format("Multiple screens with same name, using: %s", result))
+        return result
+    else
+        log(string.format("Using single screen name: %s", base))
+        return base
+    end
+end
+
 function obj:parseDisplayConfig(config)
     local displays = {}
     
-    -- Handle both old and new format
     if config.displays then
-        -- New format
-        for name, settings in pairs(config.displays) do
-            displays[name] = {
-                priority = settings.priority or self.config.defaultDisplayPriority,
-                dimLevel = settings.dimLevel
-            }
+        log("Parsing display configuration:")
+        -- Build a set of currently connected unique display names and UUIDs
+        local currentDisplays = {}
+        
+        log("Currently connected screens:")
+        for _, screen in ipairs(self:getCurrentScreens()) do
+            local uniqueName = self:getUniqueNameForScreen(screen)
+            local uuid = screen:getUUID() or screen:id()
+            
+            currentDisplays[uniqueName] = true
+            if uuid then
+                currentDisplays[uuid] = true
+                log(string.format("  - Screen: %s (UUID: %s)", uniqueName, uuid))
+            else
+                log(string.format("  - Screen: %s", uniqueName))
+            end
         end
-    elseif config.displayPriorities then
-        -- Old format compatibility
-        for name, value in pairs(config.displayPriorities) do
-            if type(value) == "number" then
-                displays[name] = {
-                    priority = value,
-                    dimLevel = nil
-                }
-            elseif type(value) == "table" then
-                displays[name] = {
-                    priority = value[1] or self.config.defaultDisplayPriority,
-                    dimLevel = value[2]
-                }
+        
+        log("Processing configured displays:")
+        for name, settings in pairs(config.displays or {}) do
+            log(string.format("  Processing display: %s", name))
+            -- Check if it's a UUID pattern
+            local isUUID = name:match("^%x%x%x%x%x%x%x%x%-")
+            
+            if isUUID then
+                log(string.format("    Is UUID: %s (connected: %s)", 
+                    name, tostring(currentDisplays[name] == true)))
+                if currentDisplays[name] then
+                    if type(settings) == "table" then
+                        local priority = settings.priority or self.config.defaultDisplayPriority
+                        log(string.format("    UUID %s: using priority %d", name, priority))
+                        displays[name] = {
+                            priority = priority,
+                            dimLevel = settings.dimLevel
+                        }
+                    end
+                else
+                    log(string.format("    UUID %s not found in current displays", name))
+                end
+            else
+                log(string.format("    Is regular name: %s (connected: %s)", 
+                    name, tostring(currentDisplays[name] == true)))
+                if currentDisplays[name] then
+                    if type(settings) == "table" then
+                        local priority = settings.priority or self.config.defaultDisplayPriority
+                        log(string.format("    %s: using priority %d", name, priority))
+                        displays[name] = {
+                            priority = priority,
+                            dimLevel = settings.dimLevel
+                        }
+                    end
+                else
+                    log(string.format("    Display %s not found in current displays", name))
+                end
             end
         end
     end
@@ -352,6 +464,18 @@ function obj:sortScreensByPriority(screens)
         return self:sortScreensUncached(screens)
     end
 
+    if self.config.logging then
+        log("Current screens and their configured priorities:")
+        for _, screen in ipairs(screens) do
+            local uniqueName = self:getUniqueNameForScreen(screen)
+            local settings = self.config.displays[uniqueName] or {}
+            log(string.format("  - %s (configured priority: %s)", 
+                uniqueName, 
+                tostring(settings.priority or "default")
+            ))
+        end
+    end
+
     local currentHash = self:computeConfigHash(self.config.displays)
     
     -- Check if cache is valid using hash
@@ -360,33 +484,14 @@ function obj:sortScreensByPriority(screens)
                       self.lastPriorityConfig == currentHash
 
     if cacheValid then
-        if self.config.cacheDebugEnabled then
-            log("Using cached priority order for " .. #screens .. " screens")
+        if self.config.logging then
+            log("Using cached priority order")
         end
         return self.cachedPrioritizedScreens
     end
 
-    -- Safety check for screens array
-    if not screens or #screens == 0 then
-        log("No screens provided to sort", true)
-        return screens
-    end
-
-    -- Check if cache is valid
-    local cacheValid = self.cachedPrioritizedScreens and
-                      #self.cachedPrioritizedScreens == #screens and
-                      self.lastPriorityConfig == self.config.displays
-
-    if cacheValid then
-        if self.config.cacheDebugEnabled then
-            log("Using cached priority order for " .. #screens .. " screens")
-        end
-        return self.cachedPrioritizedScreens
-    end
-
-    -- Cache miss - perform sort
-    if self.config.cacheDebugEnabled then
-        log("Priority cache miss - sorting " .. #screens .. " screens")
+    if self.config.logging then
+        log("Cache invalid - performing new sort")
     end
 
     local sortedScreens = self:sortScreensUncached(screens)
@@ -394,11 +499,10 @@ function obj:sortScreensByPriority(screens)
     -- Store hash when caching
     self.lastPriorityConfig = currentHash
     self.cachedPrioritizedScreens = sortedScreens
-    
+
     return sortedScreens
 end
 
--- Helper function to do the actual sorting
 function obj:sortScreensUncached(screens)
     if not self.config.displays or not next(self.config.displays) then
         return screens
@@ -410,20 +514,27 @@ function obj:sortScreensUncached(screens)
     end
     
     table.sort(prioritizedScreens, function(a, b)
-        local settingsA = self.config.displays[a:name()] or {}
-        local settingsB = self.config.displays[b:name()] or {}
+        local uniqueA = self:getUniqueNameForScreen(a)
+        local uniqueB = self:getUniqueNameForScreen(b)
+        local settingsA = self.config.displays[uniqueA] or {}
+        local settingsB = self.config.displays[uniqueB] or {}
         local priorityA = settingsA.priority or self.config.defaultDisplayPriority
         local priorityB = settingsB.priority or self.config.defaultDisplayPriority
+        
+        if self.config.logging then
+            log(string.format("Comparing %s (priority %d) with %s (priority %d)",
+                uniqueA, priorityA, uniqueB, priorityB))
+        end
         return priorityA < priorityB
     end)
     
-    -- Log the priority order
     if self.config.logging then
-        log("Display priority order:")
+        log("Priority-sorted screens:")
         for i, screen in ipairs(prioritizedScreens) do
-            local settings = self.config.displays[screen:name()] or {}
-            local priority = settings.priority or self.config.defaultDisplayPriority
-            log(string.format("  %d. %s (priority: %d)", i, screen:name(), priority))
+            local uniqueName = self:getUniqueNameForScreen(screen)
+            local settings = self.config.displays[uniqueName] or {}
+            log(string.format("  %d. %s (priority: %d)", 
+                i, uniqueName, settings.priority or self.config.defaultDisplayPriority))
         end
     end
     
@@ -436,6 +547,33 @@ function obj:display(priority, dimLevel)
         priority = priority,
         dimLevel = dimLevel
     }
+end
+
+function obj:getDisplayIdentifier(screen)
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local lunarDisplays = self:getLunarDisplayNames()
+    local displayInfo = nil
+
+    -- First try exact match
+    displayInfo = lunarDisplays[uniqueName]
+
+    -- If not found and it's a UUID, try direct UUID lookup
+    if not displayInfo and uniqueName:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") then
+        return uniqueName
+    end
+
+    -- If still not found, try matching without sequence numbers
+    if not displayInfo then
+        local baseEdid = uniqueName:gsub("%s*%([%d]+%)", "")
+        displayInfo = lunarDisplays[baseEdid]
+    end
+
+    -- Special case for Built-in display
+    if not displayInfo and uniqueName:match("Built%-in") then
+        displayInfo = lunarDisplays["Built-in"]
+    end
+
+    return displayInfo and displayInfo.serial or nil
 end
 
 -- Initialize ScreenDimmer
@@ -622,7 +760,7 @@ function obj:validateState()
 end
 
 function obj:verifyDisplayState(screen, expectedValue, isSubzero)
-    local screenName = screen:name()
+    local uniqueName = self:getUniqueNameForScreen(screen)
     local maxAttempts = 3
     local attempt = 1
     local verified = false
@@ -637,24 +775,24 @@ function obj:verifyDisplayState(screen, expectedValue, isSubzero)
         
         if not current then
             log(string.format("Failed to get current state for %s (attempt %d/%d)", 
-                screenName, attempt, maxAttempts))
+                uniqueName, attempt, maxAttempts))
             attempt = attempt + 1
             hs.timer.usleep(300000)  -- 300ms delay between attempts
             goto continue
         end
         
         local tolerance = isSubzero and 1 or 
-                         (screenName:match("Built%-in") and 5 or 10)
+                         (uniqueName:match("Built%-in") and 5 or 10)
         
         if math.abs(current - expectedValue) <= tolerance then
             verified = true
             log(string.format("Display state verified for %s: %d (tolerance: %d)", 
-                screenName, current, tolerance))
+                uniqueName, current, tolerance))
             break
         end
         
         log(string.format("Verification failed for %s: expected=%d, got=%d (attempt %d/%d)", 
-            screenName, expectedValue, current, attempt, maxAttempts))
+            uniqueName, expectedValue, current, attempt, maxAttempts))
         
         attempt = attempt + 1
         hs.timer.usleep(500000)  -- 500ms delay between attempts
@@ -666,7 +804,7 @@ function obj:verifyDisplayState(screen, expectedValue, isSubzero)
 end
 
 function obj:handleOperationFailure(operation, screen)
-    log(string.format("Operation failed: %s on %s", operation, screen:name()), true)
+    log(string.format("Operation failed: %s on %s", operation, self:getUniqueNameForScreen(screen)), true)
     
     -- Increment failure counter
     self.state.failedOperations = (self.state.failedOperations or 0) + 1
@@ -740,8 +878,8 @@ function obj:executeWakeReset()
         
         -- First disable subzero on all screens
         for _, screen in ipairs(screens) do
-            local screenName = screen:name()
-            local lunarName = self:getLunarDisplayNames()[screenName]
+            local uniqueName = self:getUniqueNameForScreen(screen)
+            local lunarName = self:getLunarDisplayNames()[uniqueName]
             
             if lunarName then
                 self:executeLunarCommand(
@@ -758,19 +896,19 @@ function obj:executeWakeReset()
         
         -- Then set brightness on all screens
         for _, screen in ipairs(screens) do
-            local screenName = screen:name()
-            local lunarName = self:getLunarDisplayNames()[screenName]
+            local uniqueName = self:getUniqueNameForScreen(screen)
+            local lunarName = self:getLunarDisplayNames()[uniqueName]
             
             if lunarName then
                 local targetBrightness = 50
                 if self.state.preSleepBrightness and 
-                   self.state.preSleepBrightness[screenName] then
-                    targetBrightness = self.state.preSleepBrightness[screenName]
+                   self.state.preSleepBrightness[uniqueName] then
+                    targetBrightness = self.state.preSleepBrightness[uniqueName]
                     log(string.format("Restoring pre-sleep brightness for %s: %d", 
-                        screenName, targetBrightness))
+                        uniqueName, targetBrightness))
                 else
                     log(string.format("No pre-sleep brightness found for %s, using default", 
-                        screenName))
+                        uniqueName))
                 end
                 
                 -- Set brightness
@@ -778,28 +916,28 @@ function obj:executeWakeReset()
                     string.format("%s displays \"%s\" brightness %d", 
                         self.lunarPath, lunarName, targetBrightness)
                 ) then
-                    processedScreens[screenName] = targetBrightness
+                    processedScreens[uniqueName] = targetBrightness
                 else
-                    log(string.format("Failed to set brightness for %s", screenName), true)
+                    log(string.format("Failed to set brightness for %s", uniqueName), true)
                 end
                 
                 -- Small delay between brightness commands
                 hs.timer.usleep(200000)  -- 200ms
             else
-                log("No Lunar name found for " .. screenName)
+                log("No Lunar name found for " .. uniqueName)
             end
         end
 
         -- Verify brightness after all screens are processed
         hs.timer.doAfter(1, function()
             local allVerified = true
-            for screenName, targetBrightness in pairs(processedScreens) do
-                local screen = hs.screen.find(screenName)
+            for uniqueName, targetBrightness in pairs(processedScreens) do
+                local screen = hs.screen.find(uniqueName)
                 if screen then
                     local current = self:getHardwareBrightness(screen)
                     if not current or math.abs(current - targetBrightness) > 10 then
                         log(string.format("Brightness verification failed for %s: expected=%d, got=%s",
-                            screenName, targetBrightness, tostring(current)), true)
+                            uniqueName, targetBrightness, tostring(current)), true)
                         allVerified = false
                     end
                 end
@@ -891,7 +1029,7 @@ function obj:handleScreenChange()
     local screens = self:sortScreensByPriority(self:getCurrentScreens())
     log(string.format("New screen configuration detected: %d display(s)", #screens))
     for _, screen in ipairs(screens) do
-        log(string.format("- Display: %s", screen:name()))
+        log(string.format("- Display: %s", self:getUniqueNameForScreen(screen)))
     end
     
     -- Reapply dimming if needed
@@ -948,8 +1086,28 @@ function obj:configure(config)
             end
         end
         
+        -- Log the raw display configuration
+        log("Raw display configuration:")
+        for name, settings in pairs(config.displays or {}) do
+            log(string.format("  %s: priority=%s, dimLevel=%s",
+                name,
+                tostring(settings.priority),
+                tostring(settings.dimLevel)
+            ))
+        end
+        
         -- Parse display configuration
         self.config.displays = self:parseDisplayConfig(config)
+        
+        -- Log the parsed configuration
+        log("Parsed display configuration:")
+        for name, settings in pairs(self.config.displays or {}) do
+            log(string.format("  %s: priority=%s, dimLevel=%s",
+                name,
+                tostring(settings.priority),
+                tostring(settings.dimLevel)
+            ))
+        end
     end
 
     -- Verify lunar CLI path
@@ -1149,185 +1307,217 @@ function obj:toggle()
     end
 end
 
--- Get hardware brightness (without subzero/gamma effects)
 function obj:getHardwareBrightness(screen)
-    local screenName = screen:name()
-    local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[screenName]
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local displayId = screen:getUUID() or screen:id() or uniqueName
     
-    if not lunarName then
-        log(string.format("Display '%s' not found in Lunar display list", screenName), true)
+    -- Get the Lunar display name/identifier
+    local lunarDisplays = self:getLunarDisplayNames()
+    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
+    
+    if not displayInfo then
+        -- Try without sequence numbers
+        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
+        -- Try special case for Built-in
+        if not displayInfo and uniqueName:match("Built%-in") then
+            displayInfo = lunarDisplays["Built-in"]
+        end
+    end
+
+    if not displayInfo then
+        log(string.format("No Lunar mapping found for display: %s", uniqueName))
         return nil
     end
 
-    -- Only disable subzero if it’s actually negative
+    -- Use the proper identifier (serial or name)
+    local identifier = displayInfo.serial or displayInfo.name
+    if not identifier then
+        log(string.format("No valid identifier found for display: %s", uniqueName))
+        return nil
+    end
+
+    -- First disable subzero if needed
     local currentSubzero = self:getSubzeroDimming(screen)
     if currentSubzero and currentSubzero < 0 then
         local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
-            self.lunarPath, lunarName)
-
+            self.lunarPath, identifier)
         if not self:executeLunarCommand(cmdDisableSubzero) then
-            log("Failed to disable subzero for hardware brightness read", true)
+            log("Failed to disable subzero")
             return nil
         end
-        hs.timer.usleep(200000)  -- short wait only if we toggled subzero
+        hs.timer.usleep(200000)  -- 200ms delay
     end
 
-    -- Small delay to let changes take effect
-    hs.timer.usleep(200000)  -- 0.2 seconds
-    
-    -- Now get the actual hardware brightness
+    -- Get hardware brightness
     local command = string.format("%s displays \"%s\" brightness --read", 
-        self.lunarPath, lunarName)
+        self.lunarPath, identifier)
     
     local success, output = self:executeLunarCommand(command)
     if not success then
-        log("Failed to read hardware brightness", true)
+        log(string.format("Failed to read brightness for %s", uniqueName))
         return nil
     end
     
-    local brightness = output and output:match("brightness:%s*(%d+)")
-    return brightness and tonumber(brightness)
+    -- Parse brightness from output like "BenQ PD3225U\n\tbrightness: 30"
+    local brightness = output:match("brightness:%s*(%d+)")
+    if not brightness then
+        log(string.format("Could not parse brightness value from output: %s", output))
+        return nil
+    end
+    
+    return tonumber(brightness)
 end
 
--- Set brightness for a screen
 function obj:setBrightness(screen, targetValue)
-    local screenName = screen:name()
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local displayId = screen:getUUID() or screen:id() or uniqueName
     local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[screenName]
-    local isInternalDisplay = screenName:match("Built%-in")
+    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
     
-    if not lunarName then
-        log(string.format("Display '%s' not found in Lunar display list", screenName), true)
+    if not displayInfo then
+        -- Try without sequence numbers
+        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
+        -- Try special case for Built-in
+        if not displayInfo and uniqueName:match("Built%-in") then
+            displayInfo = lunarDisplays["Built-in"]
+        end
+    end
+
+    if not displayInfo then
+        log(string.format("Display '%s' not found in Lunar display list", uniqueName), true)
         return false
     end
 
-    if targetValue < 0 then
-        if isInternalDisplay then
-            -- Enable adaptive subzero first
-            local cmdAdaptive = string.format("%s displays \"%s\" adaptiveSubzero true", 
-                self.lunarPath, lunarName)
-            self:executeLunarCommand(cmdAdaptive)
-            hs.timer.usleep(100000)  -- 100ms wait
-            
-            -- Then set the target value
-            local targetSubzero = (100 + targetValue) / 100
-            local cmdSubzero = string.format("%s displays \"%s\" subzeroDimming %.2f", 
-                self.lunarPath, lunarName, targetSubzero)
-            if not self:executeLunarCommand(cmdSubzero) then
-                log("Failed to set subzero dimming", true)
-                return false
-            end
-            
-            log(string.format("Set subzero brightness for '%s': %.2f", 
-                screenName, targetSubzero))
-        else
-            -- For external displays, try the same approach
-            local cmdAdaptive = string.format("%s displays \"%s\" adaptiveSubzero true", 
-                self.lunarPath, lunarName)
-            self:executeLunarCommand(cmdAdaptive)
-            hs.timer.usleep(100000)  -- 100ms wait
-            
-            local targetSubzero = (100 + targetValue) / 100
-            local cmdSubzero = string.format("%s displays \"%s\" subzeroDimming %.2f", 
-                self.lunarPath, lunarName, targetSubzero)
-            if not self:executeLunarCommand(cmdSubzero) then
-                return false
-            end
-        end
+    -- Use the proper identifier (serial or name)
+    local identifier = displayInfo.serial or displayInfo.name
+    if not identifier then
+        log(string.format("No valid identifier found for display: %s", uniqueName))
+        return false
+    end
     
-        log(string.format("Set subzero brightness for '%s': %.2f", 
-            screenName, (100 + targetValue) / 100))
+    if targetValue < 0 then
+        local cmdAdaptive = string.format("%s displays \"%s\" adaptiveSubzero true", 
+            self.lunarPath, identifier)
+        if not self:executeLunarCommand(cmdAdaptive) then
+            log("Failed to enable adaptive subzero", true)
+            return false
+        end
+        hs.timer.usleep(100000)
+        
+        local targetSubzero = (100 + targetValue) / 100
+        local cmdSubzero = string.format("%s displays \"%s\" subzeroDimming %.2f", 
+            self.lunarPath, identifier, targetSubzero)
+        if not self:executeLunarCommand(cmdSubzero) then
+            log("Failed to set subzero dimming", true)
+            return false
+        end
     else
-        -- For positive values, only disable subzero if currently negative
         local currentSubzero = self:getSubzeroDimming(screen)
         if currentSubzero and currentSubzero < 0 then
             local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
-                self.lunarPath, lunarName)
-            
+                self.lunarPath, identifier)
             if not self:executeLunarCommand(cmdDisableSubzero) then
                 log("Failed to disable subzero", true)
                 return false
             end
-            
-            -- Short wait only if we toggled subzero
             hs.timer.usleep(200000)
         end
         
-        -- Set brightness
         local cmdBrightness = string.format("%s displays \"%s\" brightness %d", 
-            self.lunarPath, lunarName, targetValue)
-        
+            self.lunarPath, identifier, targetValue)
         if not self:executeLunarCommand(cmdBrightness) then
             log("Failed to set brightness", true)
             return false
         end
-        
-        log(string.format("Set regular brightness for '%s': %d", 
-            screenName, targetValue))
     end
     
+    log(string.format("Set brightness for '%s' to %d", displayInfo.name, targetValue))
     return true
 end
 
 -- Get current subzero dimming level
 function obj:getSubzeroDimming(screen)
-    local screenName = screen:name()
-    local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[screenName]
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local displayId = screen:getUUID() or screen:id() or uniqueName
     
-    if not lunarName then
-        log(string.format("Display '%s' not found in Lunar display list", screenName), true)
+    local lunarDisplays = self:getLunarDisplayNames()
+    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
+    
+    if not displayInfo then
+        log(string.format("No Lunar mapping found for display: %s", uniqueName))
+        return nil
+    end
+
+    local identifier = displayInfo.name
+    if not identifier then
+        log(string.format("No valid identifier found for display: %s", uniqueName))
         return nil
     end
 
     local command = string.format("%s displays \"%s\" subzeroDimming", 
-        self.lunarPath, lunarName)
+        self.lunarPath, identifier)
     
     local success, output = self:executeLunarCommand(command)
     if not success then
-        log("Failed to read subzero dimming", true)
+        log(string.format("Failed to read subzero dimming for %s", uniqueName))
         return nil
     end
 
-    local dimming = output and output:match("subzeroDimming:%s*([%d%.]+)")
+    -- Parse subzero value
+    local dimming = output:match("subzeroDimming:%s*([%d%.]+)")
     if dimming then
         local value = tonumber(dimming)
-        -- Convert from 0-1 range to our -100-0 range
-        return math.floor((value * 100) - 100)
+        return math.floor((value * 100) - 100)  -- Convert to our scale
     end
     return nil
 end
 
 -- Set subzero dimming level
-function obj:setSubzeroDimming(screen, level)
-    local screenName = screen:name()
+function obj:setBrightness(screen, value)
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local displayId = screen:getUUID() or screen:id() or uniqueName
+    
     local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[screenName]
+    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
     
-    if not lunarName then return false end
-    
-    -- Enable subzero mode
-    local cmdEnableSubzero = string.format("%s displays \"%s\" subzero true", 
-        self.lunarPath, lunarName)
-        
-    if not self:executeLunarCommand(cmdEnableSubzero) then
+    if not displayInfo then
+        log(string.format("No Lunar mapping found for display: %s", uniqueName))
         return false
     end
-    
-    -- Set dimming level (convert from -100..0 to 0..1 range)
-    local dimming = (100 + level) / 100  -- level is negative
-    local cmdSetDimming = string.format("%s displays \"%s\" subzeroDimming %.2f", 
-        self.lunarPath, lunarName, dimming)
-    
-    return self:executeLunarCommand(cmdSetDimming)
+
+    local identifier = displayInfo.serial or displayInfo.name
+    if not identifier then
+        log(string.format("No valid identifier found for display: %s", uniqueName))
+        return false
+    end
+
+    -- Handle negative values (subzero/gamma)
+    if value < 0 then
+        -- Enable subzero mode
+        local cmdEnableSubzero = string.format("%s displays \"%s\" subzero true", 
+            self.lunarPath, identifier)
+        if not self:executeLunarCommand(cmdEnableSubzero) then
+            return false
+        end
+        
+        -- Set dimming level
+        local dimming = (100 + value) / 100  -- Convert from our scale
+        local cmdSetDimming = string.format("%s displays \"%s\" subzeroDimming %.2f", 
+            self.lunarPath, identifier, dimming)
+        return self:executeLunarCommand(cmdSetDimming)
+    else
+        -- Regular brightness
+        local command = string.format("%s displays \"%s\" brightness %d", 
+            self.lunarPath, identifier, value)
+        return self:executeLunarCommand(command)
+    end
 end
 
 -- Disable subzero dimming
 function obj:disableSubzero(screen)
-    local screenName = screen:name()
+    local uniqueName = self:getUniqueNameForScreen(screen)
     local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[screenName]
+    local lunarName = lunarDisplays[uniqueName]
     
     if not lunarName then return false end
     
@@ -1395,19 +1585,21 @@ function obj:dimScreens()
     -- Show priority order
     log("Display priority order:")
     for i, screen in ipairs(screens) do
-        log(string.format("  %d. %s (priority: %d)", 
-            i, screen:name(), self.config.displayPriorities[screen:name()] or 999))
+        local uniqueName = self:getUniqueNameForScreen(screen)
+        local settings = self.config.displays[uniqueName] or {}
+        local priority = settings.priority or self.config.defaultDisplayPriority
+        log(string.format("  %d. %s (priority: %d)", i, uniqueName, priority))
     end
 
     -- Store pre-dim brightness for all screens
     self.state.preSleepBrightness = {}
     for _, screen in ipairs(screens) do
-        local screenName = screen:name()
+        local uniqueName = self:getUniqueNameForScreen(screen)
         local currentBrightness = self:getHardwareBrightness(screen)
         if currentBrightness then
-            self.state.preSleepBrightness[screenName] = currentBrightness
+            self.state.preSleepBrightness[uniqueName] = currentBrightness
             log(string.format("Stored pre-dim brightness for %s: %d", 
-                screenName, currentBrightness))
+                uniqueName, currentBrightness))
         end
     end
     
@@ -1418,11 +1610,11 @@ function obj:dimScreens()
 
     -- First pass: compute and store states
     for _, screen in ipairs(screens) do
-        local screenName = screen:name()
-        local lunarName = self:getLunarDisplayNames()[screenName]
+        local uniqueName = self:getUniqueNameForScreen(screen)
+        local lunarName = self:getLunarDisplayNames()[uniqueName]
         
         if not lunarName then
-            log("Cannot find Lunar name for " .. screenName)
+            log("Cannot find Lunar name for " .. uniqueName)
             goto continue
         end
 
@@ -1431,12 +1623,12 @@ function obj:dimScreens()
         local currentBrightness = self:getHardwareBrightness(screen)
         
         if not currentBrightness then
-            log(string.format("Could not get current brightness for %s", screenName))
+            log(string.format("Could not get current brightness for %s", uniqueName))
             goto continue
         end
 
         -- Calculate final dim level
-        local displaySettings = self.config.displays[screenName] or {}
+        local displaySettings = self.config.displays[uniqueName] or {}
         local finalLevel = displaySettings.dimLevel or self.config.dimLevel
 
         -- Special handling for 0: treat it as -1 (minimal gamma dimming)
@@ -1448,35 +1640,35 @@ function obj:dimScreens()
         finalLevel = math.max(-100, math.min(100, finalLevel))
 
         -- Store all computed values
-        self.state.originalBrightness[screenName] = currentBrightness
-        self.state.originalSubzero[screenName] = currentSubzero
-        finalLevels[screenName] = finalLevel
+        self.state.originalBrightness[uniqueName] = currentBrightness
+        self.state.originalSubzero[uniqueName] = currentSubzero
+        finalLevels[uniqueName] = finalLevel
 
         log(string.format("Stored original for %s => br=%d, subz=%s, target=%d", 
-            screenName, currentBrightness, tostring(currentSubzero), finalLevel))
+            uniqueName, currentBrightness, tostring(currentSubzero), finalLevel))
 
         ::continue::
     end
 
     -- Second pass: apply dim settings
     for _, screen in ipairs(screens) do
-        local screenName = screen:name()
-        local finalLevel = finalLevels[screenName]
+        local uniqueName = self:getUniqueNameForScreen(screen)
+        local finalLevel = finalLevels[uniqueName]
         
         if not finalLevel then goto continue end
 
-        local currentBrightness = self.state.originalBrightness[screenName]
+        local currentBrightness = self.state.originalBrightness[uniqueName]
         
         -- Skip if target is brighter than current
         if finalLevel >= currentBrightness then
             log(string.format("Skipping dim on %s (finalLevel=%d >= current=%d)",
-                screenName, finalLevel, currentBrightness))
+                uniqueName, finalLevel, currentBrightness))
             goto continue
         end
 
         -- Apply the dim settings
         if not self:setBrightness(screen, finalLevel) then
-            log(string.format("Failed to set brightness for %s", screenName), true)
+            log(string.format("Failed to set brightness for %s", uniqueName), true)
         end
 
         ::continue::
@@ -1492,49 +1684,49 @@ function obj:dimScreens()
         local internalDisplayVerified = false
         
         for _, screen in ipairs(screens) do
-            local screenName = screen:name()
-            local finalLevel = finalLevels[screenName]
+            local uniqueName = self:getUniqueNameForScreen(screen)
+            local finalLevel = finalLevels[uniqueName]
             
             if not finalLevel then goto continue end
 
             -- First verification attempt
             if self:verifyDisplayState(screen, finalLevel, finalLevel < 0) then
                 verificationsPassed = verificationsPassed + 1
-                if screenName:match("Built%-in") then
+                if uniqueName:match("Built%-in") then
                     internalDisplayVerified = true
                 end
-                log(string.format("First verification passed for %s", screenName))
+                log(string.format("First verification passed for %s", uniqueName))
             else
                 -- For very low brightness, try one more time
                 if finalLevel <= 1 then
                     log(string.format(
                         "First verification failed for low brightness, retrying %s", 
-                        screenName))
+                        uniqueName))
                     
                     -- Retry the brightness setting
                     if not self:setBrightness(screen, finalLevel) then
-                        log(string.format("Retry failed for %s", screenName), true)
+                        log(string.format("Retry failed for %s", uniqueName), true)
                     end
                     
                     -- Second verification after delay
                     hs.timer.doAfter(1.0, function()
                         if self:verifyDisplayState(screen, finalLevel, finalLevel < 0) then
                             verificationsPassed = verificationsPassed + 1
-                            if screenName:match("Built%-in") then
+                            if uniqueName:match("Built%-in") then
                                 internalDisplayVerified = true
                             end
-                            log(string.format("Second verification passed for %s", screenName))
+                            log(string.format("Second verification passed for %s", uniqueName))
                         else
                             log(string.format(
                                 "Both verifications failed for %s: target=%d", 
-                                screenName, finalLevel), true)
+                                uniqueName, finalLevel), true)
                             self:handleOperationFailure("dim", screen)
                         end
                     end)
                 else
                     log(string.format(
                         "Verification failed for %s: target=%d", 
-                        screenName, finalLevel), true)
+                        uniqueName, finalLevel), true)
                     self:handleOperationFailure("dim", screen)
                 end
             end
@@ -1617,17 +1809,26 @@ function obj:restoreBrightness()
     log("restoreBrightness called")
     self.state.isRestoring = true
 
+    -- Get screens in priority order (same as dimming)
     local screens = self:sortScreensByPriority(self:getCurrentScreens())
+    
+    -- Log the order
+    log("Restoration order (same as dim):")
+    for i, screen in ipairs(screens) do
+        local uniqueName = self:getUniqueNameForScreen(screen)
+        local settings = self.config.displays[uniqueName] or {}
+        log(string.format("  %d. %s (priority: %d)", 
+            i, uniqueName, settings.priority or self.config.defaultDisplayPriority))
+    end
+    
     local totalScreens = #screens
+    log(string.format("Restoring brightness for %d screens (in original priority order)", totalScreens))
     
-    log(string.format("Restoring brightness for %d screens", totalScreens))
-    
-    -- Start the restore sequence
-    self:restoreOneScreen(1, totalScreens, 0, 0)
+    -- Start restoration with original order
+    self:restoreOneScreen(1, totalScreens, 0, 0, screens)
 end
 
-function obj:restoreOneScreen(index, totalScreens, completedScreens, verificationsPassed)
-    local screens = self:sortScreensByPriority(self:getCurrentScreens())
+function obj:restoreOneScreen(index, totalScreens, completedScreens, verificationsPassed, screens)
     if index > #screens then
         log("Restore sequence complete")
         self:finalizeRestore(verificationsPassed, totalScreens)
@@ -1635,77 +1836,90 @@ function obj:restoreOneScreen(index, totalScreens, completedScreens, verificatio
     end
 
     local screen = screens[index]
-    local screenName = screen:name()
-    local lunarName = self:getLunarDisplayNames()[screenName]
-    local originalBrightness = self.state.originalBrightness[screenName]
-    local originalSubzero = self.state.originalSubzero[screenName]
-    local isInternal = screenName:match("Built%-in")
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local lunarIdentifier = self:getLunarDisplayIdentifier(screen)
+    local originalBrightness = self.state.originalBrightness[uniqueName]
+    local originalSubzero = self.state.originalSubzero[uniqueName]
+    local isInternal = uniqueName:match("Built%-in")
     local retryAttempts = 0
     local maxRetries = isInternal and 1 or 3  -- More retries for external displays
     
     -- Skip if missing data
-    if not (lunarName and originalBrightness) then
+    if not (lunarIdentifier and originalBrightness) then
         log(string.format(
-            "No stored brightness or missing Lunar name for %s; skipping restore", 
-            screenName
+            "No stored brightness or missing Lunar identifier for %s; skipping restore", 
+            uniqueName
         ))
-        self:restoreOneScreen(index + 1, totalScreens, completedScreens, verificationsPassed)
+        self:restoreOneScreen(index + 1, totalScreens, completedScreens, verificationsPassed, screens)
         return
     end
     
     local function attemptRestore()
         log(string.format(
             "Restoring %s => brightness=%d, subzero=%s (attempt %d/%d)",
-            screenName, originalBrightness, tostring(originalSubzero),
+            uniqueName, originalBrightness, tostring(originalSubzero),
             retryAttempts + 1, maxRetries
         ))
         
         -- First disable subzero if needed
         if originalSubzero and originalSubzero < 0 then
-            self:disableSubzero(screen)
+            local cmdDisableSubzero = string.format("%s displays \"%s\" subzero false", 
+                self.lunarPath, lunarIdentifier)
+            if not self:executeLunarCommand(cmdDisableSubzero) then
+                log("Failed to disable subzero", true)
+                if retryAttempts < maxRetries - 1 then
+                    retryAttempts = retryAttempts + 1
+                    self:createTimer(0.5, function(self)
+                        attemptRestore()
+                    end, string.format("restore retry %d for %s", retryAttempts + 1, uniqueName))
+                else
+                    self:resetDisplayState(lunarIdentifier)
+                    self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed, screens)
+                end
+                return
+            end
             hs.timer.usleep(300000)  -- 300ms wait after subzero change
         end
         
         -- Then set the hardware brightness
         local cmdBrightness = string.format(
             "%s displays \"%s\" brightness %d", 
-            self.lunarPath, lunarName, originalBrightness
+            self.lunarPath, lunarIdentifier, originalBrightness
         )
-        log("Executing: " .. cmdBrightness)
         
-        if not self:executeLunarCommand(cmdBrightness, 2, 0.3) then
-            log(string.format("Failed to set brightness for %s", screenName), true)
+        if not self:executeLunarCommand(cmdBrightness) then
+            log(string.format("Failed to set brightness for %s", uniqueName), true)
             if retryAttempts < maxRetries - 1 then
                 retryAttempts = retryAttempts + 1
                 self:createTimer(0.5, function(self)
                     attemptRestore()
-                end, string.format("brightness retry %d for %s", retryAttempts + 1, screenName))
+                end, string.format("restore retry %d for %s", retryAttempts + 1, uniqueName))
             else
-                self:resetDisplayState(lunarName)
-                self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed)
+                self:resetDisplayState(lunarIdentifier)
+                self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed, screens)
             end
             return
         end
         
         self:createTimer(isInternal and 0.3 or 0.8, function(self)
             if self:verifyDisplayState(screen, originalBrightness, false) then
-                log(string.format("Verification passed for %s", screenName))
-                self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed + 1)
+                log(string.format("Verification passed for %s", uniqueName))
+                self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed + 1, screens)
             else
                 if retryAttempts < maxRetries - 1 then
                     retryAttempts = retryAttempts + 1
                     self:createTimer(0.5, function(self)
                         attemptRestore()
-                    end, string.format("restore retry %d for %s", retryAttempts + 1, screenName))
+                    end, string.format("restore retry %d for %s", retryAttempts + 1, uniqueName))
                 else
-                    log(string.format("All retries failed for %s", screenName), true)
+                    log(string.format("All retries failed for %s", uniqueName), true)
                     self.state.failedRestoreAttempts = (self.state.failedRestoreAttempts or 0) + 1
                     self:handleOperationFailure("restore", screen)
-                    self:resetDisplayState(lunarName)
-                    self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed)
+                    self:resetDisplayState(lunarIdentifier)
+                    self:restoreOneScreen(index + 1, totalScreens, completedScreens + 1, verificationsPassed, screens)
                 end
             end
-        end, string.format("verify restore for %s", screenName))
+        end, string.format("verify restore for %s", uniqueName))
     end
 
     attemptRestore()
@@ -2064,6 +2278,20 @@ function obj:executeLunarCommand(cmd, maxRetries, timeout)
 
     maxRetries = maxRetries or (self.state.isWaking and 5 or 2)
     timeout = timeout or (self.state.isWaking and 0.3 or 0.5)
+
+    -- Clean up command if it contains a table reference
+    if cmd:match("table: 0x%x+") then
+        log("Warning: Command contains table reference, attempting to clean: " .. cmd)
+        -- Extract the actual command parts
+        local cmdParts = {}
+        for part in cmd:gmatch("%S+") do
+            if not part:match("^table:") then
+                table.insert(cmdParts, part)
+            end
+        end
+        cmd = table.concat(cmdParts, " ")
+        log("Cleaned command: " .. cmd)
+    end
 
     local function attempt(retryCount)
         if isTimedOut() then
