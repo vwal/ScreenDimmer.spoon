@@ -257,14 +257,14 @@ function obj:getLunarDisplayNames()
     log("All attempts to get Lunar display list failed", true)
     return {}
 end
-
 function obj:getLunarDisplayIdentifier(screen)
     local uniqueName = self:getUniqueNameForScreen(screen)
+    local displayId = screen:getUUID() or screen:id() or uniqueName
     local lunarDisplays = self:getLunarDisplayNames()
     local displayInfo = nil
 
     -- First try exact match
-    displayInfo = lunarDisplays[uniqueName]
+    displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
 
     -- If not found and it's a UUID, try direct UUID lookup
     if not displayInfo and screen:getUUID() then
@@ -282,8 +282,13 @@ function obj:getLunarDisplayIdentifier(screen)
         displayInfo = lunarDisplays["Built-in"]
     end
 
-    -- Return the serial or name, with name as fallback
-    return displayInfo and (displayInfo.serial or displayInfo.name) or uniqueName
+    if not displayInfo then
+        log(string.format("No Lunar mapping found for display: %s", uniqueName), true)
+        return nil
+    end
+
+    -- Return the proper identifier (serial or name)
+    return displayInfo.serial or displayInfo.name
 end
 
 local function getLunarName(screen, uniqueName)
@@ -879,15 +884,17 @@ function obj:executeWakeReset()
         -- First disable subzero on all screens
         for _, screen in ipairs(screens) do
             local uniqueName = self:getUniqueNameForScreen(screen)
-            local lunarName = self:getLunarDisplayNames()[uniqueName]
+            local identifier = self:getLunarDisplayIdentifier(screen)
             
-            if lunarName then
+            if identifier then
                 self:executeLunarCommand(
                     string.format("%s displays \"%s\" subzero false", 
-                        self.lunarPath, lunarName)
+                        self.lunarPath, identifier)
                 )
                 -- Small delay between subzero commands
                 hs.timer.usleep(100000)  -- 100ms
+            else
+                log(string.format("No Lunar identifier found for %s", uniqueName))
             end
         end
         
@@ -897,12 +904,12 @@ function obj:executeWakeReset()
         -- Then set brightness on all screens
         for _, screen in ipairs(screens) do
             local uniqueName = self:getUniqueNameForScreen(screen)
-            local lunarName = self:getLunarDisplayNames()[uniqueName]
+            local identifier = self:getLunarDisplayIdentifier(screen)
             
-            if lunarName then
+            if identifier then
                 local targetBrightness = 50
                 if self.state.preSleepBrightness and 
-                   self.state.preSleepBrightness[uniqueName] then
+                self.state.preSleepBrightness[uniqueName] then
                     targetBrightness = self.state.preSleepBrightness[uniqueName]
                     log(string.format("Restoring pre-sleep brightness for %s: %d", 
                         uniqueName, targetBrightness))
@@ -914,7 +921,7 @@ function obj:executeWakeReset()
                 -- Set brightness
                 if self:executeLunarCommand(
                     string.format("%s displays \"%s\" brightness %d", 
-                        self.lunarPath, lunarName, targetBrightness)
+                        self.lunarPath, identifier, targetBrightness)
                 ) then
                     processedScreens[uniqueName] = targetBrightness
                 else
@@ -924,7 +931,7 @@ function obj:executeWakeReset()
                 -- Small delay between brightness commands
                 hs.timer.usleep(200000)  -- 200ms
             else
-                log("No Lunar name found for " .. uniqueName)
+                log("No Lunar identifier found for " .. uniqueName)
             end
         end
 
@@ -1448,7 +1455,7 @@ function obj:getSubzeroDimming(screen)
         return nil
     end
 
-    local identifier = displayInfo.name
+    local identifier = displayInfo.serial or displayInfo.name
     if not identifier then
         log(string.format("No valid identifier found for display: %s", uniqueName))
         return nil
@@ -1525,13 +1532,15 @@ end
 -- Disable subzero dimming
 function obj:disableSubzero(screen)
     local uniqueName = self:getUniqueNameForScreen(screen)
-    local lunarDisplays = self:getLunarDisplayNames()
-    local lunarName = lunarDisplays[uniqueName]
+    local identifier = self:getLunarDisplayIdentifier(screen)
     
-    if not lunarName then return false end
+    if not identifier then
+        log(string.format("No Lunar identifier found for %s", uniqueName))
+        return false
+    end
     
     local cmd = string.format("%s displays \"%s\" subzero false", 
-        self.lunarPath, lunarName)
+        self.lunarPath, identifier)
     
     return self:executeLunarCommand(cmd)
 end
@@ -1620,10 +1629,10 @@ function obj:dimScreens()
     -- First pass: compute and store states
     for _, screen in ipairs(screens) do
         local uniqueName = self:getUniqueNameForScreen(screen)
-        local lunarName = self:getLunarDisplayNames()[uniqueName]
+        local identifier = self:getLunarDisplayIdentifier(screen)
         
-        if not lunarName then
-            log("Cannot find Lunar name for " .. uniqueName)
+        if not identifier then
+            log("Cannot find Lunar identifier for " .. uniqueName)
             goto continue
         end
 
@@ -1652,9 +1661,11 @@ function obj:dimScreens()
         self.state.originalBrightness[uniqueName] = currentBrightness
         self.state.originalSubzero[uniqueName] = currentSubzero
         finalLevels[uniqueName] = finalLevel
+        -- Also store the Lunar identifier for later use
+        finalLevels[uniqueName .. "_identifier"] = identifier
 
-        log(string.format("Stored original for %s => br=%d, subz=%s, target=%d", 
-            uniqueName, currentBrightness, tostring(currentSubzero), finalLevel))
+        log(string.format("Stored original for %s (%s) => br=%d, subz=%s, target=%d", 
+            uniqueName, identifier, currentBrightness, tostring(currentSubzero), finalLevel))
 
         ::continue::
     end
@@ -2225,53 +2236,45 @@ function obj:caffeineWatcherCallback(eventType)
             self.state.originalBrightness = {}
             self.state.originalSubzero = {}
         end
-
-        -- Use stored pre-sleep brightness values if available
-        if self.state.preSleepBrightness then
-            log("Found pre-sleep brightness values:")
-            for screen, brightness in pairs(self.state.preSleepBrightness) do
-                log(string.format("  %s: %d", screen, brightness))
-            end
-        end
-        
+    
         -- Stop the checker immediately
         if self.stateChecker then
             self.stateChecker:stop()
         end
     
-        -- First ensure Lunar is running
-        if not self:ensureLunarRunning() then
-            log("Waiting for Lunar to restart after wake")
-            -- resetDisplaysAfterWake will be called by ensureLunarRunning after restart
-        else
-            -- Perform display reset with saved values if Lunar is already running
-            self:resetDisplaysAfterWake(true)
-        end
-
-        -- Set up a sequence of delayed actions
-        hs.timer.doAfter(3, function()
-            -- Only proceed if Lunar isn't in the middle of restarting
-            if not self.state.lunarRestartInProgress then
-                self.state.isWaking = false
+        -- Always restart Lunar after wake
+        log("Restarting Lunar after wake", true)
+        hs.execute("killall Lunar")
+        self.state.lastLunarRestart = now
+        
+        -- Wait and restart
+        hs.timer.doAfter(2, function()
+            hs.execute("open -a Lunar")
+            -- Clear our display cache
+            self:invalidateCaches()
+            
+            -- Wait for Lunar to initialize
+            hs.timer.doAfter(3, function()
+                -- Now perform display reset
+                self:resetDisplaysAfterWake(true)
                 
-                -- Reset user action time again after wake delay
-                self.state.lastUserAction = hs.timer.secondsSinceEpoch()
-                
-                -- Only restart checker if we're not locked
-                if not self.state.lockState then
-                    -- Add extra delay before restarting checker
-                    hs.timer.doAfter(2, function()
-                        if self.stateChecker then
-                            self.stateChecker:start()
-                            -- One final reset of user action time
-                            self.state.lastUserAction = hs.timer.secondsSinceEpoch()
-                        end
-                    end)
-                end
-            else
-                log("Skipping wake sequence completion while Lunar is restarting")
-            end
+                -- Continue with wake sequence
+                hs.timer.doAfter(2, function()
+                    self.state.isWaking = false
+                    self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+                    
+                    if not self.state.lockState then
+                        hs.timer.doAfter(2, function()
+                            if self.stateChecker then
+                                self.stateChecker:start()
+                                self.state.lastUserAction = hs.timer.secondsSinceEpoch()
+                            end
+                        end)
+                    end
+                end)
+            end)
         end)
+        
         log("System woke from sleep.")
     end
 end
