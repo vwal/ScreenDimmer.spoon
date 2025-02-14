@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "8.0",
+    version = "8.1",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -37,14 +37,6 @@ local obj = {
         -- Minimum time (in seconds) between processing unlock events
         unlockDebounceInterval = 0.5,
 
-        -- Optional dimming/undimmg priorities for specific displays
-        displayPriorities = {},
-        -- Example:
-        -- displayPriorities = {
-        --     ["Built-in"] = 1,
-        --     ["BenQ PD3225U"] = 2,
-        --     ["LG Ultra HD"] = 3
-        -- }
         -- Default priority for displays not specified in displayPriorities
         defaultDisplayPriority = 999,
 
@@ -216,13 +208,7 @@ function obj:getLunarDisplayNames()
                     -- Store by full name and serial
                     displays[currentDisplay] = info
                     displays[currentSerial] = info
-                    
-                    -- Handle Built-in display special cases
-                    if currentDisplay == "Built-in" then
-                        displays["Built-in Retina Display"] = info
-                        displays["Built-in"] = info
-                    end
-                    
+                        
                     -- Store base EDID name (without sequence numbers)
                     local baseEdid = currentDisplay:gsub("%s*%([%d]+%)", "")
                     if not displays[baseEdid] then
@@ -257,6 +243,7 @@ function obj:getLunarDisplayNames()
     log("All attempts to get Lunar display list failed", true)
     return {}
 end
+
 function obj:getLunarDisplayIdentifier(screen)
     local uniqueName = self:getUniqueNameForScreen(screen)
     local displayId = screen:getUUID() or screen:id() or uniqueName
@@ -277,9 +264,9 @@ function obj:getLunarDisplayIdentifier(screen)
         displayInfo = lunarDisplays[baseEdid]
     end
 
-    -- Special case for Built-in display
-    if not displayInfo and uniqueName:match("Built%-in") then
-        displayInfo = lunarDisplays["Built-in"]
+    -- Last resort: try internal display if configured
+    if not displayInfo then
+        displayInfo = self:findInternalDisplay(lunarDisplays)
     end
 
     if not displayInfo then
@@ -289,6 +276,29 @@ function obj:getLunarDisplayIdentifier(screen)
 
     -- Return the proper identifier (serial or name)
     return displayInfo.serial or displayInfo.name
+end
+
+function obj:getLunarDisplayInfoForScreen(screen, lunarDisplays)
+    local uniqueName = self:getUniqueNameForScreen(screen)
+    local displayId = screen:getUUID() or screen:id() or uniqueName
+    
+    -- Try direct matches first
+    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
+    
+    if not displayInfo then
+        -- Try without sequence numbers
+        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
+        
+        -- Try internal display if configured
+        if not displayInfo then
+            local settings = self.config.displays[uniqueName]
+            if settings and settings.isInternal then
+                displayInfo = self:findInternalDisplay(lunarDisplays)
+            end
+        end
+    end
+    
+    return displayInfo
 end
 
 function obj:getCurrentScreens()
@@ -530,10 +540,11 @@ function obj:sortScreensUncached(screens)
 end
 
 -- Helper method for display configuration
-function obj:display(priority, dimLevel)
+function obj:display(priority, dimLevel, isInternal)
     return {
         priority = priority,
-        dimLevel = dimLevel
+        dimLevel = dimLevel,
+        isInternal = isInternal == "internal"  -- true if "internal" passed
     }
 end
 
@@ -670,12 +681,51 @@ function obj:init()
     return self
 end
 
-local function waitForInternalDisplay(callback)
+function obj:findInternalDisplay(displays)
+    for name, settings in pairs(self.config.displays or {}) do
+        if settings.isInternal then
+            if displays[name] then
+                return displays[name]
+            elseif displays["Built-in"] then
+                -- Log that we're using legacy fallback
+                log(string.format(
+                    "Warning: Using legacy 'Built-in' fallback for internal display '%s'", 
+                    name), true)
+                return displays["Built-in"]
+            end
+        end
+    end
+    return nil
+end
+
+function findInternalDisplayInfo()
+    for name, settings in pairs(self.config.displays or {}) do
+        if settings.isInternal then
+            return {
+                screen = hs.screen.find(name),
+                name = name
+            }
+        end
+    end
+    return nil
+end
+
+function waitForInternalDisplay(callback)
     local attempts = 0
     local maxAttempts = 5
+    
+    local function findInternalScreen()
+        for name, settings in pairs(self.config.displays or {}) do
+            if settings.isInternal then
+                return hs.screen.find(name)
+            end
+        end
+        return nil
+    end
+    
     local function check()
         attempts = attempts + 1
-        local internal = hs.screen.find("Built%-in")
+        local internal = findInternalScreen()
         if internal or attempts >= maxAttempts then
             if not internal then
                 log("Internal display not found after " .. attempts .. " attempts", true)
@@ -723,6 +773,7 @@ end
 
 function obj:verifyDisplayState(screen, expectedValue, isSubzero)
     local uniqueName = self:getUniqueNameForScreen(screen)
+    local displaySettings = self.config.displays[uniqueName] or {}
     local maxAttempts = 3
     local attempt = 1
     local verified = false
@@ -744,7 +795,7 @@ function obj:verifyDisplayState(screen, expectedValue, isSubzero)
         end
         
         local tolerance = isSubzero and 1 or 
-                         (uniqueName:match("Built%-in") and 5 or 10)
+                            (displaySettings.isInternal and 5 or 10)
         
         if math.abs(current - expectedValue) <= tolerance then
             verified = true
@@ -970,20 +1021,21 @@ function obj:handleScreenChange()
     end
 
     -- Handle internal display first
-    local internalDisplay = hs.screen.find("Built%-in")
-    if internalDisplay then
+    local internalInfo = findInternalDisplayInfo()
+    if internalInfo and internalInfo.screen then
         log("Ensuring internal display state during configuration change")
         self:executeLunarCommand(
-            string.format("%s displays \"Built-in\" subzero false", self.lunarPath),
+            string.format("%s displays \"%s\" subzero false", 
+                self.lunarPath, internalInfo.name),
             3, 0.5
         )
         
         -- Verify state after short delay
         hs.timer.doAfter(0.5, function()
-            local current = self:getHardwareBrightness(internalDisplay)
+            local current = self:getHardwareBrightness(internalInfo.screen)
             if not current or current < 20 then
                 log("Internal display needs recovery during config change", true)
-                self:resetDisplayState("Built-in")
+                self:resetDisplayState(internalInfo.name)
             end
         end)
     end
@@ -1045,11 +1097,11 @@ function obj:configure(config)
         log(".. with overriding values:")
         -- Apply all configurations except display settings
         for k, v in pairs(config) do
-            if k ~= "displays" and k ~= "displayPriorities" then
+            if k ~= "displays" then
                 self.config[k] = v
             end
         end
-        
+
         -- Log the raw display configuration
         log("Raw display configuration:")
         for name, settings in pairs(config.displays or {}) do
@@ -1153,15 +1205,16 @@ function obj:start(showAlert)
                     hs.eventtap.event.types.mouseMoved
                 }, function(event)
                     if self.state.lockState or self.state.isRestoring then
+                        log("Skipping event due to lock or restore state")
                         return false
                     end
-
+        
                     local now = hs.timer.secondsSinceEpoch()
-
+        
                     -- Add safety check for lastScreenSaverEvent
                     local screenSaverCooldown = (self.state.lastScreenSaverEvent and 
                         (now - self.state.lastScreenSaverEvent) < 3.0)
-
+        
                     -- Strict ignore period after hotkey or screen events
                     if (now - self.state.lastHotkeyTime) < 2.0 or screenSaverCooldown then
                         if self.config.logging then
@@ -1169,15 +1222,15 @@ function obj:start(showAlert)
                         end
                         return false
                     end
-
+        
                     -- Only process events if enough time has passed since last action
                     if (now - self.state.lastUserAction) > 0.1 then
                         self.state.lastUserAction = now
-
+                        log("User activity detected, isDimmed=" .. tostring(self.state.isDimmed) .. 
+                            ", isHotkeyDimming=" .. tostring(self.state.isHotkeyDimming))
+        
                         if self.state.isDimmed and not self.state.isHotkeyDimming then
-                            if self.config.logging then
-                                log("User action while dimmed, restoring brightness")
-                            end
+                            log("Triggering brightness restore")
                             self:restoreBrightness()
                         end
                     end
@@ -1277,16 +1330,7 @@ function obj:getHardwareBrightness(screen)
     
     -- Get the Lunar display name/identifier
     local lunarDisplays = self:getLunarDisplayNames()
-    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
-    
-    if not displayInfo then
-        -- Try without sequence numbers
-        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
-        -- Try special case for Built-in
-        if not displayInfo and uniqueName:match("Built%-in") then
-            displayInfo = lunarDisplays["Built-in"]
-        end
-    end
+    local displayInfo = self:getLunarDisplayInfoForScreen(screen, lunarDisplays)
 
     if not displayInfo then
         log(string.format("No Lunar mapping found for display: %s", uniqueName))
@@ -1336,17 +1380,8 @@ function obj:setBrightness(screen, targetValue)
     local uniqueName = self:getUniqueNameForScreen(screen)
     local displayId = screen:getUUID() or screen:id() or uniqueName
     local lunarDisplays = self:getLunarDisplayNames()
-    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
+    local displayInfo = self:getLunarDisplayInfoForScreen(screen, lunarDisplays)
     
-    if not displayInfo then
-        -- Try without sequence numbers
-        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
-        -- Try special case for Built-in
-        if not displayInfo and uniqueName:match("Built%-in") then
-            displayInfo = lunarDisplays["Built-in"]
-        end
-    end
-
     if not displayInfo then
         log(string.format("Display '%s' not found in Lunar display list", uniqueName), true)
         return false
@@ -1440,17 +1475,8 @@ function obj:setSubzeroDimming(screen, level)
     local uniqueName = self:getUniqueNameForScreen(screen)
     local displayId = screen:getUUID() or screen:id() or uniqueName
     local lunarDisplays = self:getLunarDisplayNames()
-    local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
+    local displayInfo = self:getLunarDisplayInfoForScreen(screen, lunarDisplays)
     
-    if not displayInfo then
-        -- Try without sequence numbers
-        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
-        -- Try special case for Built-in
-        if not displayInfo and uniqueName:match("Built%-in") then
-            displayInfo = lunarDisplays["Built-in"]
-        end
-    end
-
     if not displayInfo then
         log(string.format("Display '%s' not found in Lunar display list", uniqueName), true)
         return false
@@ -1663,13 +1689,15 @@ function obj:dimScreens()
         for _, screen in ipairs(screens) do
             local uniqueName = self:getUniqueNameForScreen(screen)
             local finalLevel = finalLevels[uniqueName]
+            local settings = self.config.displays[uniqueName]
+            local isInternal = settings and settings.isInternal
             
             if not finalLevel then goto continue end
-
+        
             -- First verification attempt
             if self:verifyDisplayState(screen, finalLevel, finalLevel < 0) then
                 verificationsPassed = verificationsPassed + 1
-                if uniqueName:match("Built%-in") then
+                if isInternal then
                     internalDisplayVerified = true
                 end
                 log(string.format("First verification passed for %s", uniqueName))
@@ -1689,7 +1717,7 @@ function obj:dimScreens()
                     hs.timer.doAfter(1.0, function()
                         if self:verifyDisplayState(screen, finalLevel, finalLevel < 0) then
                             verificationsPassed = verificationsPassed + 1
-                            if uniqueName:match("Built%-in") then
+                            if isInternal then
                                 internalDisplayVerified = true
                             end
                             log(string.format("Second verification passed for %s", uniqueName))
@@ -1707,18 +1735,18 @@ function obj:dimScreens()
                     self:handleOperationFailure("dim", screen)
                 end
             end
-
+        
             ::continue::
         end
 
         -- Update overall state
-        if internalDisplayVerified then
+        if verificationsPassed > 0 then
             self.state.isDimmed = true
             self.state.failedRestoreAttempts = 0
             
             if verificationsPassed < #screens then
                 log(string.format(
-                    "Partial dim success: %d/%d screens (internal verified)", 
+                    "Partial dim success: %d/%d screens verified", 
                     verificationsPassed, #screens))
             else
                 log("All screens dimmed successfully")
@@ -1729,6 +1757,18 @@ end
 
 -- Restore brightness function
 function obj:restoreBrightness()
+    log(string.format("restoreBrightness called with states: isDimmed=%s, isRestoring=%s, restoreInProgress=%s, globalOperationInProgress=%s",
+        tostring(self.state.isDimmed),
+        tostring(self.state.isRestoring),
+        tostring(self.state.restoreInProgress),
+        tostring(self.state.globalOperationInProgress)
+    ))
+
+    if self.state.globalOperationInProgress then
+        log("Global operation in progress, skipping restore")
+        return
+    end
+
     if self.state.globalOperationInProgress then
         log("Global operation in progress, skipping restore")
         return
@@ -1811,16 +1851,22 @@ function obj:restoreOneScreen(index, totalScreens, completedScreens, verificatio
         self:finalizeRestore(verificationsPassed, totalScreens)
         return
     end
-
+    
     local screen = screens[index]
     local uniqueName = self:getUniqueNameForScreen(screen)
+    local displaySettings = self.config.displays[uniqueName] or {}
     local lunarIdentifier = self:getLunarDisplayIdentifier(screen)
+    
+    log(string.format("Attempting to restore screen %d/%d: %s (Lunar ID: %s)",
+        index, totalScreens, uniqueName, tostring(lunarIdentifier)))
+    
     local originalBrightness = self.state.originalBrightness[uniqueName]
     local originalSubzero = self.state.originalSubzero[uniqueName]
-    local isInternal = uniqueName:match("Built%-in")
+    local settings = self.config.displays[uniqueName]
+    local isInternal = settings and settings.isInternal
     local retryAttempts = 0
-    local maxRetries = isInternal and 1 or 3  -- More retries for external displays
-    
+    local maxRetries = displaySettings.isInternal and 1 or 3  -- More retries for external displays
+
     -- Skip if missing data
     if not (lunarIdentifier and originalBrightness) then
         log(string.format(
