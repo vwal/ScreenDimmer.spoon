@@ -3,7 +3,7 @@ local obj = {
     
     -- Metadata
     name = "ScreenDimmer",
-    version = "7.5",
+    version = "8.0",
     author = "Ville Walveranta",
     license = "MIT",
     
@@ -1472,16 +1472,23 @@ function obj:getSubzeroDimming(screen)
     return nil
 end
 
--- Set subzero dimming level
-function obj:setBrightness(screen, value)
+function obj:setSubzeroDimming(screen, level)
     local uniqueName = self:getUniqueNameForScreen(screen)
     local displayId = screen:getUUID() or screen:id() or uniqueName
-    
     local lunarDisplays = self:getLunarDisplayNames()
     local displayInfo = lunarDisplays[displayId] or lunarDisplays[uniqueName]
     
     if not displayInfo then
-        log(string.format("No Lunar mapping found for display: %s", uniqueName))
+        -- Try without sequence numbers
+        displayInfo = lunarDisplays[uniqueName:gsub("%s*%([%d]+%)", "")]
+        -- Try special case for Built-in
+        if not displayInfo and uniqueName:match("Built%-in") then
+            displayInfo = lunarDisplays["Built-in"]
+        end
+    end
+
+    if not displayInfo then
+        log(string.format("Display '%s' not found in Lunar display list", uniqueName), true)
         return false
     end
 
@@ -1491,26 +1498,28 @@ function obj:setBrightness(screen, value)
         return false
     end
 
-    -- Handle negative values (subzero/gamma)
-    if value < 0 then
-        -- Enable subzero mode
-        local cmdEnableSubzero = string.format("%s displays \"%s\" subzero true", 
-            self.lunarPath, identifier)
-        if not self:executeLunarCommand(cmdEnableSubzero) then
-            return false
-        end
-        
-        -- Set dimming level
-        local dimming = (100 + value) / 100  -- Convert from our scale
-        local cmdSetDimming = string.format("%s displays \"%s\" subzeroDimming %.2f", 
-            self.lunarPath, identifier, dimming)
-        return self:executeLunarCommand(cmdSetDimming)
-    else
-        -- Regular brightness
-        local command = string.format("%s displays \"%s\" brightness %d", 
-            self.lunarPath, identifier, value)
-        return self:executeLunarCommand(command)
+    -- Enable subzero mode
+    local cmdEnableSubzero = string.format("%s displays \"%s\" subzero true",
+        self.lunarPath, identifier)
+    if not self:executeLunarCommand(cmdEnableSubzero) then
+        log("Failed to enable subzero mode", true)
+        return false
     end
+
+    hs.timer.usleep(100000)  -- Small delay for mode switch
+
+    -- Set dimming level (convert from -100..0 to 0..1 range)
+    local dimming = (100 + level) / 100  -- level is negative
+    local cmdSetDimming = string.format("%s displays \"%s\" subzeroDimming %.2f",
+        self.lunarPath, identifier, dimming)
+
+    if not self:executeLunarCommand(cmdSetDimming) then
+        log("Failed to set subzero dimming level", true)
+        return false
+    end
+
+    log(string.format("Set subzero dimming for '%s' to %.2f", displayInfo.name, dimming))
+    return true
 end
 
 -- Disable subzero dimming
