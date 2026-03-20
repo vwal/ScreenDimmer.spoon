@@ -53,6 +53,9 @@ obj.defaults = {
     internalMinBrightness = 2,   -- built-in: slightly above zero
     externalMinBrightness = 1,   -- externals: near zero
 
+    -- Safety reset: force-restore if stuck in dimming/restoring state
+    stuckTimeout      = 30,        -- seconds before force-reset (0 to disable)
+
     -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
 
@@ -72,8 +75,10 @@ obj.fadeTask          = nil      -- hs.task for Lunar CLI commands
 obj.queryTask         = nil      -- hs.task for async display queries
 obj.enabled           = false
 obj.dimStartTime      = 0        -- for activity cooldown
+obj.stateChangeTime   = 0        -- for stuck-state detection
 obj.activityTap       = nil
 obj.idleCheckTimer    = nil
+obj.stuckCheckTimer   = nil
 obj.caffeinateWatcher = nil
 obj.screenWatcher     = nil
 obj.hotkeys           = {}
@@ -319,6 +324,7 @@ function obj:dimScreens()
     logAlways("Starting dim sequence")
     self.state = "dimming"
     self.dimStartTime = hs.timer.secondsSinceEpoch()
+    self.stateChangeTime = self.dimStartTime
     self.savedState = {}
     self.savedGamma = {}
 
@@ -424,6 +430,7 @@ function obj:restoreScreens()
 
     self:cancelFade()
     self.state = "restoring"
+    self.stateChangeTime = hs.timer.secondsSinceEpoch()
     logAlways("Starting restore sequence")
 
     if not next(self.savedState) then
@@ -513,6 +520,43 @@ function obj:restoreScreens()
 end
 
 ----------------------------------------------------------------------
+-- Stuck-state safety reset
+----------------------------------------------------------------------
+
+--- Force-reset everything to a known good state.
+function obj:forceReset()
+    logAlways("SAFETY RESET: force-restoring from state '%s'", self.state)
+    self:cancelFade()
+    hs.screen.restoreGamma()
+
+    -- Attempt hardware brightness restore via Lunar
+    if next(self.savedState) then
+        local cmds = {}
+        for serial, saved in pairs(self.savedState) do
+            cmds[#cmds + 1] = self:lunarCmd(serial, "brightness", saved.brightness)
+            cmds[#cmds + 1] = self:lunarCmd(serial, "adaptiveSubzero", true)
+        end
+        self:runLunarScript(cmds, nil)
+    end
+
+    self.state = "idle"
+    self.savedState = {}
+    self.savedGamma = {}
+    logAlways("Safety reset complete")
+end
+
+--- Check if we're stuck in a transient state too long.
+function obj:checkStuck()
+    if self.config.stuckTimeout <= 0 then return end
+    if self.state ~= "dimming" and self.state ~= "restoring" then return end
+
+    local elapsed = hs.timer.secondsSinceEpoch() - self.stateChangeTime
+    if elapsed >= self.config.stuckTimeout then
+        self:forceReset()
+    end
+end
+
+----------------------------------------------------------------------
 -- Activity detection & idle checking
 ----------------------------------------------------------------------
 
@@ -548,6 +592,12 @@ function obj:startWatchers()
             self:dimScreens()
         end
     end)
+
+    if self.config.stuckTimeout > 0 then
+        self.stuckCheckTimer = hs.timer.doEvery(self.config.checkInterval, function()
+            self:checkStuck()
+        end)
+    end
 
     self.caffeinateWatcher = hs.caffeinate.watcher.new(function(event)
         if event == hs.caffeinate.watcher.systemDidWake then
@@ -588,6 +638,7 @@ end
 function obj:stopWatchers()
     if self.activityTap       then self.activityTap:stop();       self.activityTap = nil       end
     if self.idleCheckTimer    then self.idleCheckTimer:stop();    self.idleCheckTimer = nil    end
+    if self.stuckCheckTimer   then self.stuckCheckTimer:stop();   self.stuckCheckTimer = nil   end
     if self.caffeinateWatcher then self.caffeinateWatcher:stop(); self.caffeinateWatcher = nil end
     if self.screenWatcher     then self.screenWatcher:stop();     self.screenWatcher = nil     end
 end
