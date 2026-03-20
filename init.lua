@@ -5,31 +5,30 @@
 --- Each display can be configured individually or by category (internal/external).
 ---
 --- ARCHITECTURE:
----   External displays use hs.screen:setGamma() at ~30fps for buttery
----   smooth transitions, all fading simultaneously. The gamma overlay stays
----   applied while dimmed (no handoff to Lunar subzero).
----   Internal (built-in) display uses Lunar CLI subzero fade (macOS protects
----   the internal display's gamma table, so setGamma() is ineffective).
----   Both paths run in parallel so the internal display fades at the same
----   time as externals. Lunar CLI is also used to disable adaptiveSubzero
----   during dimming (prevent interference) and re-enable it on restore.
+---   Hybrid hardware + gamma dimming. First, hardware brightness (DDC/backlight)
+---   is reduced to a configurable minimum via Lunar CLI. Then hs.screen:setGamma()
+---   provides smooth gamma overlay dimming at ~30fps on ALL displays (including
+---   built-in). Lunar CLI is used only for hardware brightness control and
+---   adaptiveSubzero management (disabled during dimming, re-enabled on restore).
 ---
 ---   Display mapping: hs.screen:getUUID() matches Lunar's display serial
 ---   (both use CGDisplayCreateUUIDFromDisplayID internally).
 ---
 --- Dim level convention:
----   Positive (1–100): hardware brightness target
----   Zero: hardware brightness 0
----   Negative (-1 to -100): subzero dimming via gamma overlay
+---   Positive (1–100): hardware brightness target only
+---   Zero: hardware brightness at configured minimum, no gamma/subzero
+---   Negative (-1 to -100): hardware brightness at minimum + gamma/subzero
 ---     Formula: whitepoint = (100 + dimLevel) / 100
----     Examples: -30 → 0.70, -80 → 0.20, -99 → 0.01
+---     Examples: -30 → hw min + wp 0.70, -80 → hw min + wp 0.20, -99 → hw min + wp 0.01
+---
+---   Per-display minBrightness prevents full blackout (default: 2 internal, 1 external)
 
 local obj = {}
 obj.__index = obj
 
 -- Spoon metadata
 obj.name = "ScreenDimmer"
-obj.version = "2.0"
+obj.version = "3.0"
 obj.author = ""
 obj.license = "MIT"
 
@@ -41,7 +40,7 @@ local log = hs.logger.new("ScreenDimmer", "info")
 
 obj.defaults = {
     idleTimeout      = 300,      -- seconds before dimming
-    fadeDuration     = 2.0,      -- seconds for smooth gamma fade
+    fadeDuration     = 1.0,      -- seconds for smooth gamma fade
     fadeInterval     = 0.033,    -- ~30fps gamma updates
     checkInterval    = 5,        -- idle-check frequency (seconds)
     lunarPath        = os.getenv("HOME") .. "/.local/bin/lunar",
@@ -49,6 +48,10 @@ obj.defaults = {
     -- Category defaults for dim level
     internalDimLevel  = -30,     -- built-in display
     externalDimLevel  = -80,     -- external displays
+
+    -- Minimum hardware brightness (just above zero to prevent blackout)
+    internalMinBrightness = 2,   -- built-in: slightly above zero
+    externalMinBrightness = 1,   -- externals: near zero
 
     -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
@@ -176,6 +179,13 @@ function obj:getDimLevel(serial, isInternal)
     local dc = self.config.displays[serial]
     if dc and dc.dimLevel then return dc.dimLevel end
     return isInternal and self.config.internalDimLevel or self.config.externalDimLevel
+end
+
+--- Resolve the minimum hardware brightness for a display.
+function obj:getMinBrightness(serial, isInternal)
+    local dc = self.config.displays[serial]
+    if dc and dc.minBrightness then return dc.minBrightness end
+    return isInternal and self.config.internalMinBrightness or self.config.externalMinBrightness
 end
 
 --- Resolve the priority for a display.
@@ -321,14 +331,16 @@ function obj:dimScreens()
             return
         end
 
-        -- Separate displays into gamma targets (external) and Lunar targets (internal)
+        -- Separate displays into:
+        --   gammaTargets: external displays using setGamma() for smooth fade
+        --   lunarCmds: all Lunar CLI commands (hardware brightness + subzero)
         local gammaTargets = {}
-        local lunarInternalCmds = {}  -- internal: preamble + fade (runs first)
-        local lunarExternalCmds = {}  -- external: adaptiveSubzero false (runs after)
+        local lunarCmds = {}
 
         for serial, d in pairs(displays) do
             local dimLevel = self:getDimLevel(serial, d.isInternal)
             local priority = self:getDisplayPriority(serial, d.isInternal)
+            local minBr = self:getMinBrightness(serial, d.isInternal)
 
             self.savedState[serial] = {
                 brightness     = d.brightness,
@@ -343,65 +355,38 @@ function obj:dimScreens()
                 self.savedGamma[serial] = screen:getGamma()
             end
 
-            if d.isInternal then
-                -- Internal display: setGamma doesn't work, use Lunar CLI subzero
-                logAlways("Dim %s (%s…): brightness %d → level %d [priority %d] [Lunar]",
-                    d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
+            -- Disable adaptive subzero for all displays during dimming
+            table.insert(lunarCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
 
-                table.insert(lunarInternalCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
-                if dimLevel < 0 then
-                    local targetSZD = (100 + dimLevel) / 100
-                    table.insert(lunarInternalCmds, self:lunarCmd(serial, "subzero", true))
-                    table.insert(lunarInternalCmds, self:lunarCmd(serial, "subzeroDimming", 1.0))
-                    table.insert(lunarInternalCmds, "sleep 0.1")
-                    -- More steps, no extra sleep — Lunar's ~250ms latency paces naturally
-                    -- 8 steps × ~250ms ≈ 2s, matching gamma fade duration
-                    local steps = 8
-                    local gamma_exp = 2.2
-                    local from_p = 1.0
-                    local to_p   = targetSZD ^ (1 / gamma_exp)
-                    local lastVal = nil
-                    for step = 1, steps do
-                        local progress = step / steps
-                        local p_val = from_p + (to_p - from_p) * progress
-                        local raw = p_val ^ gamma_exp
-                        local value = math.floor(raw * 100 + 0.5) / 100
-                        if value ~= lastVal then
-                            table.insert(lunarInternalCmds, self:lunarCmd(serial, "subzeroDimming", value))
-                            lastVal = value
-                        end
-                    end
+            if dimLevel > 0 then
+                -- Positive dimLevel: hardware brightness only, no gamma/subzero
+                logAlways("Dim %s (%s…): brightness %d → %d [priority %d] [hardware]",
+                    d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
+                if d.brightness > dimLevel then
+                    table.insert(lunarCmds, self:lunarCmd(serial, "brightness", dimLevel))
                 end
             else
-                -- External display: smooth gamma fade via setGamma
-                logAlways("Dim %s (%s…): brightness %d → level %d [priority %d] [gamma]",
-                    d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
+                -- Zero or negative dimLevel: reduce hardware to minimum, then gamma/subzero
+                logAlways("Dim %s (%s…): brightness %d → min %d, level %d [priority %d] [gamma]",
+                    d.name, serial:sub(1, 8), d.brightness, minBr, dimLevel, priority)
 
-                table.insert(lunarExternalCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
+                -- Reduce hardware brightness to minimum
+                if d.brightness > minBr then
+                    table.insert(lunarCmds, self:lunarCmd(serial, "brightness", minBr))
+                end
 
                 if dimLevel < 0 then
+                    -- All displays: smooth gamma fade via setGamma at ~30fps
                     local targetWP = (100 + dimLevel) / 100
                     table.insert(gammaTargets, {
                         uuid   = serial,
                         fromWP = 1.0,
                         toWP   = targetWP,
                     })
-                else
-                    local targetWP = dimLevel / math.max(d.brightness, 1)
-                    targetWP = math.max(0.01, math.min(1.0, targetWP))
-                    table.insert(gammaTargets, {
-                        uuid   = serial,
-                        fromWP = 1.0,
-                        toWP   = targetWP,
-                    })
                 end
+                -- dimLevel == 0: hardware minimum only, no gamma/subzero needed
             end
         end
-
-        -- Build Lunar script: internal first (time-critical), external adaptive last
-        local lunarCmds = {}
-        for _, cmd in ipairs(lunarInternalCmds) do table.insert(lunarCmds, cmd) end
-        for _, cmd in ipairs(lunarExternalCmds) do table.insert(lunarCmds, cmd) end
 
         -- Run Lunar script and gamma fade in parallel
         local pending = 0
@@ -448,102 +433,82 @@ function obj:restoreScreens()
         return
     end
 
-    -- Separate into gamma targets (external) and Lunar targets (internal)
+    -- Phase 1: Restore gamma (visual), then Phase 2: restore hardware brightness
     local gammaTargets = {}
-    local lunarCmds = {}
+    local brightnessCmds = {}  -- hardware brightness restore (runs after gamma)
 
     for serial, saved in pairs(self.savedState) do
         local dimLevel = self:getDimLevel(serial, saved.isInternal)
 
-        if saved.isInternal then
-            -- Internal: restore via Lunar CLI subzero fade
-            if dimLevel < 0 then
-                local curSZD = (100 + dimLevel) / 100
-                local steps = 8
-                local gamma_exp = 2.2
-                local from_p = curSZD ^ (1 / gamma_exp)
-                local to_p   = 1.0
-                local lastVal = nil
-                for step = 1, steps do
-                    local progress = step / steps
-                    local p_val = from_p + (to_p - from_p) * progress
-                    local raw = p_val ^ gamma_exp
-                    local value = math.floor(raw * 100 + 0.5) / 100
-                    if value ~= lastVal then
-                        table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", value))
-                        lastVal = value
-                    end
-                end
-                -- Restore original subzero state
-                if saved.subzero then
-                    table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", saved.subzeroDimming))
-                else
-                    table.insert(lunarCmds, self:lunarCmd(serial, "subzero", false))
-                end
+        if dimLevel > 0 then
+            -- Was hardware-only dim: just restore brightness
+            if saved.brightness ~= dimLevel then
+                table.insert(brightnessCmds, self:lunarCmd(serial, "brightness", saved.brightness))
             end
-            table.insert(lunarCmds, self:lunarCmd(serial, "adaptiveSubzero", true))
+            table.insert(brightnessCmds, self:lunarCmd(serial, "adaptiveSubzero", true))
         else
-            -- External: smooth gamma fade back to 1.0
-            local fromWP
+            -- Was hardware + gamma dim: smooth gamma fade back to 1.0
             if dimLevel < 0 then
-                fromWP = (100 + dimLevel) / 100
-            else
-                fromWP = dimLevel / math.max(saved.brightness, 1)
-                fromWP = math.max(0.01, math.min(1.0, fromWP))
+                local fromWP = (100 + dimLevel) / 100
+                table.insert(gammaTargets, {
+                    uuid   = serial,
+                    fromWP = fromWP,
+                    toWP   = 1.0,
+                })
             end
-            table.insert(gammaTargets, {
-                uuid   = serial,
-                fromWP = fromWP,
-                toWP   = 1.0,
-            })
+
+            -- Restore hardware brightness (after gamma/subzero restore)
+            local minBr = self:getMinBrightness(serial, saved.isInternal)
+            if saved.brightness > minBr then
+                table.insert(brightnessCmds, self:lunarCmd(serial, "brightness", saved.brightness))
+            end
+            table.insert(brightnessCmds, self:lunarCmd(serial, "adaptiveSubzero", true))
         end
     end
 
-    -- Add adaptiveSubzero true for external displays (after gamma fade completes)
-    local externalSerials = {}
-    for serial, saved in pairs(self.savedState) do
-        if not saved.isInternal then
-            table.insert(externalSerials, serial)
-        end
-    end
-
-    -- Run Lunar script and gamma fade in parallel
+    -- Run gamma restore, then hardware brightness restore
     local pending = 0
-    local function onPartDone()
+    local function onGammaDone()
         pending = pending - 1
         if pending == 0 and self.state == "restoring" then
             hs.screen.restoreGamma()
-            -- Re-enable adaptive for external displays
-            if #externalSerials > 0 then
-                local cmds = {}
-                for _, serial in ipairs(externalSerials) do
-                    table.insert(cmds, self:lunarCmd(serial, "adaptiveSubzero", true))
-                end
-                self:runLunarScript(cmds, nil)
+            -- Phase 2: restore hardware brightness
+            if #brightnessCmds > 0 then
+                self:runLunarScript(brightnessCmds, function(ok)
+                    self.state = "idle"
+                    self.savedState = {}
+                    self.savedGamma = {}
+                    logAlways("All displays restored (hardware brightness)")
+                end)
+            else
+                self.state = "idle"
+                self.savedState = {}
+                self.savedGamma = {}
+                logAlways("All displays restored")
             end
-            self.state = "idle"
-            self.savedState = {}
-            self.savedGamma = {}
-            logAlways("All displays restored")
         end
-    end
-
-    if #lunarCmds > 0 then
-        pending = pending + 1
-        self:runLunarScript(lunarCmds, function(ok) onPartDone() end)
     end
 
     if #gammaTargets > 0 then
         pending = pending + 1
-        self:runGammaFade(gammaTargets, function() onPartDone() end)
+        self:runGammaFade(gammaTargets, function() onGammaDone() end)
     end
 
     if pending == 0 then
         hs.screen.restoreGamma()
-        self.state = "idle"
-        self.savedState = {}
-        self.savedGamma = {}
-        logAlways("Nothing to restore")
+        if #brightnessCmds > 0 then
+            self:runLunarScript(brightnessCmds, function(ok)
+                self.state = "idle"
+                self.savedState = {}
+                self.savedGamma = {}
+                logAlways("All displays restored (hardware brightness)")
+            end)
+        else
+            self.state = "idle"
+            self.savedState = {}
+            self.savedGamma = {}
+            logAlways("Nothing to restore")
+        end
     end
 end
 
@@ -701,9 +666,10 @@ function obj:bindHotkeys(mapping)
     return self
 end
 
-function obj:display(dimLevel, priority)
+function obj:display(dimLevel, priority, minBrightness)
     local d = { dimLevel = dimLevel }
     if priority then d.priority = priority end
+    if minBrightness then d.minBrightness = minBrightness end
     return d
 end
 
