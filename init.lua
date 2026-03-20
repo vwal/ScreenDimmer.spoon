@@ -903,6 +903,16 @@ end
 
 function obj:start()
     if not next(self.config) then self:configure({}) end
+
+    -- Check accessibility permissions (required for eventtap)
+    if not hs.accessibilityState() then
+        logAlways("Accessibility permission not granted — requesting")
+        hs.alert.show("ScreenDimmer needs Accessibility permission")
+        -- Prompt for permission (opens System Settings)
+        hs.accessibilityState(true)
+        return self
+    end
+
     self.enabled    = true
     self.state      = "idle"
     self.savedState = {}
@@ -957,6 +967,14 @@ function obj:bindHotkeys(mapping)
         table.insert(self.hotkeys,
             hs.hotkey.bind(mapping.dim[1], mapping.dim[2],
                 function() self:dimNow() end))
+    end
+    if mapping.reset then
+        table.insert(self.hotkeys,
+            hs.hotkey.bind(mapping.reset[1], mapping.reset[2],
+                function()
+                    self:forceReset()
+                    hs.alert.show("ScreenDimmer: force reset")
+                end))
     end
     return self
 end
