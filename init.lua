@@ -64,6 +64,11 @@ obj.defaults = {
     -- Screensaver cooldown
     screensaverCooldown = 3,       -- seconds to ignore activity after screensaver events
 
+    -- Restore verification
+    verifyDelay       = 1,         -- seconds to wait before verifying restore
+    verifyRetries     = 2,         -- max retry attempts if brightness mismatch
+    verifyTolerance   = 2,         -- acceptable brightness deviation (±)
+
     -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
 
@@ -450,6 +455,9 @@ function obj:restoreScreens()
         return
     end
 
+    -- Capture savedState for post-restore verification (before it gets cleared)
+    local savedStateForVerify = self.savedState
+
     -- Phase 1: Restore gamma (visual), then Phase 2: restore hardware brightness
     local gammaTargets = {}
     local brightnessCmds = {}  -- hardware brightness restore (runs after gamma)
@@ -490,18 +498,20 @@ function obj:restoreScreens()
         if pending == 0 and self.state == "restoring" then
             hs.screen.restoreGamma()
             -- Phase 2: restore hardware brightness
-            if #brightnessCmds > 0 then
-                self:runLunarScript(brightnessCmds, function(ok)
-                    self.state = "idle"
-                    self.savedState = {}
-                    self.savedGamma = {}
-                    logAlways("All displays restored (hardware brightness)")
-                end)
-            else
+            local function onRestoreComplete(msg)
                 self.state = "idle"
                 self.savedState = {}
                 self.savedGamma = {}
-                logAlways("All displays restored")
+                logAlways(msg)
+                self:scheduleVerification(savedStateForVerify)
+            end
+
+            if #brightnessCmds > 0 then
+                self:runLunarScript(brightnessCmds, function(ok)
+                    onRestoreComplete("All displays restored (hardware brightness)")
+                end)
+            else
+                onRestoreComplete("All displays restored")
             end
         end
     end
@@ -513,20 +523,101 @@ function obj:restoreScreens()
 
     if pending == 0 then
         hs.screen.restoreGamma()
-        if #brightnessCmds > 0 then
-            self:runLunarScript(brightnessCmds, function(ok)
-                self.state = "idle"
-                self.savedState = {}
-                self.savedGamma = {}
-                logAlways("All displays restored (hardware brightness)")
-            end)
-        else
+
+        local function onRestoreComplete(msg)
             self.state = "idle"
             self.savedState = {}
             self.savedGamma = {}
-            logAlways("Nothing to restore")
+            logAlways(msg)
+            self:scheduleVerification(savedStateForVerify)
+        end
+
+        if #brightnessCmds > 0 then
+            self:runLunarScript(brightnessCmds, function(ok)
+                onRestoreComplete("All displays restored (hardware brightness)")
+            end)
+        else
+            onRestoreComplete("Nothing to restore")
         end
     end
+end
+
+----------------------------------------------------------------------
+-- Restore verification
+----------------------------------------------------------------------
+
+--- Verify that displays restored to expected brightness, retry if not.
+--- `expected`: table of { serial = brightness } to verify against.
+--- `attempt`: current attempt number (1-based).
+function obj:verifyRestore(expected, attempt)
+    if self.state ~= "idle" then return end
+    if not expected or not next(expected) then return end
+
+    self:getDisplaysAsync(function(displays)
+        if self.state ~= "idle" then return end
+
+        local mismatches = {}
+        for serial, expectedBr in pairs(expected) do
+            local actual = displays[serial]
+            if actual then
+                local diff = math.abs(actual.brightness - expectedBr)
+                if diff > self.config.verifyTolerance then
+                    table.insert(mismatches, {
+                        serial     = serial,
+                        name       = actual.name,
+                        expected   = expectedBr,
+                        actual     = actual.brightness,
+                    })
+                end
+            end
+        end
+
+        if #mismatches == 0 then
+            logAlways("Restore verified: all displays at expected brightness")
+            return
+        end
+
+        -- Log mismatches
+        for _, m in ipairs(mismatches) do
+            logAlways("Restore mismatch: %s (%s…) expected %d, got %d",
+                m.name, m.serial:sub(1, 8), m.expected, m.actual)
+        end
+
+        if attempt >= self.config.verifyRetries then
+            logAlways("Restore verification failed after %d attempts", attempt)
+            return
+        end
+
+        -- Retry: send brightness commands for mismatched displays
+        logAlways("Retrying restore for %d display(s) (attempt %d/%d)",
+            #mismatches, attempt + 1, self.config.verifyRetries)
+        local cmds = {}
+        for _, m in ipairs(mismatches) do
+            table.insert(cmds, self:lunarCmd(m.serial, "brightness", m.expected))
+        end
+        self:runLunarScript(cmds, function(ok)
+            -- Verify again after delay
+            hs.timer.doAfter(self.config.verifyDelay, function()
+                self:verifyRestore(expected, attempt + 1)
+            end)
+        end)
+    end)
+end
+
+--- Start verification after restore completes.
+--- Saves expected brightness from savedState before it's cleared.
+function obj:scheduleVerification(savedState)
+    if self.config.verifyRetries <= 0 then return end
+
+    local expected = {}
+    for serial, saved in pairs(savedState) do
+        expected[serial] = saved.brightness
+    end
+    if not next(expected) then return end
+
+    hs.timer.doAfter(self.config.verifyDelay, function()
+        self:verifyRestore(expected, 1)
+    end)
 end
 
 ----------------------------------------------------------------------
@@ -673,6 +764,10 @@ function obj:startWatchers()
             logAlways("Screensaver started")
             self.screensaverActive = true
             self.lastScreensaverEvent = hs.timer.secondsSinceEpoch()
+            -- Restore brightness so monitors don't power down while dimmed
+            if self.state == "dimmed" or self.state == "dimming" then
+                self:restoreScreens()
+            end
             -- Pause idle checking while screensaver is active
             if self.idleCheckTimer then self.idleCheckTimer:stop() end
         elseif event == hs.caffeinate.watcher.screensaverDidStop then
