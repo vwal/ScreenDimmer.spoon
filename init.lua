@@ -61,6 +61,9 @@ obj.defaults = {
     wakePollInterval  = 1,         -- seconds between Lunar readiness checks
     wakePollTimeout   = 15,        -- give up polling after this many seconds
 
+    -- Screensaver cooldown
+    screensaverCooldown = 3,       -- seconds to ignore activity after screensaver events
+
     -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
 
@@ -81,6 +84,8 @@ obj.queryTask         = nil      -- hs.task for async display queries
 obj.enabled           = false
 obj.dimStartTime      = 0        -- for activity cooldown
 obj.stateChangeTime   = 0        -- for stuck-state detection
+obj.screensaverActive = false    -- screensaver state
+obj.lastScreensaverEvent = 0    -- for cooldown after screensaver events
 obj.activityTap       = nil
 obj.idleCheckTimer    = nil
 obj.stuckCheckTimer   = nil
@@ -608,8 +613,11 @@ end
 
 function obj:onActivity()
     if self.state == "dimmed" or self.state == "dimming" then
-        local elapsed = hs.timer.secondsSinceEpoch() - self.dimStartTime
-        if elapsed < 1.5 then return end
+        local now = hs.timer.secondsSinceEpoch()
+        -- Ignore activity during dim cooldown
+        if now - self.dimStartTime < 1.5 then return end
+        -- Ignore activity during screensaver cooldown (screensaver generates events)
+        if now - self.lastScreensaverEvent < self.config.screensaverCooldown then return end
         self:restoreScreens()
     end
 end
@@ -634,6 +642,7 @@ function obj:startWatchers()
 
     self.idleCheckTimer = hs.timer.doEvery(self.config.checkInterval, function()
         if not self.enabled or self.state ~= "idle" then return end
+        if self.screensaverActive then return end
         if hs.host.idleTime() >= self.config.idleTimeout then
             self:dimScreens()
         end
@@ -660,6 +669,26 @@ function obj:startWatchers()
         elseif event == hs.caffeinate.watcher.screensDidLock then
             logMsg(self, "Screen locked")
             self:cancelFade()
+        elseif event == hs.caffeinate.watcher.screensaverDidStart then
+            logAlways("Screensaver started")
+            self.screensaverActive = true
+            self.lastScreensaverEvent = hs.timer.secondsSinceEpoch()
+            -- Pause idle checking while screensaver is active
+            if self.idleCheckTimer then self.idleCheckTimer:stop() end
+        elseif event == hs.caffeinate.watcher.screensaverDidStop then
+            logAlways("Screensaver stopped")
+            self.screensaverActive = false
+            self.lastScreensaverEvent = hs.timer.secondsSinceEpoch()
+            -- Restore if dimmed when screensaver stops
+            if self.state == "dimmed" or self.state == "dimming" then
+                self:restoreScreens()
+            end
+            -- Restart idle checking after cooldown
+            hs.timer.doAfter(self.config.screensaverCooldown, function()
+                if self.enabled and self.idleCheckTimer then
+                    self.idleCheckTimer:start()
+                end
+            end)
         end
     end)
     self.caffeinateWatcher:start()
