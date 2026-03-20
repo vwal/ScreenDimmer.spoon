@@ -323,7 +323,8 @@ function obj:dimScreens()
 
         -- Separate displays into gamma targets (external) and Lunar targets (internal)
         local gammaTargets = {}
-        local lunarCmds = {}
+        local lunarInternalCmds = {}  -- internal: preamble + fade (runs first)
+        local lunarExternalCmds = {}  -- external: adaptiveSubzero false (runs after)
 
         for serial, d in pairs(displays) do
             local dimLevel = self:getDimLevel(serial, d.isInternal)
@@ -342,23 +343,22 @@ function obj:dimScreens()
                 self.savedGamma[serial] = screen:getGamma()
             end
 
-            -- Disable adaptive for all displays
-            table.insert(lunarCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
-
             if d.isInternal then
                 -- Internal display: setGamma doesn't work, use Lunar CLI subzero
                 logAlways("Dim %s (%s…): brightness %d → level %d [priority %d] [Lunar]",
                     d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
 
+                table.insert(lunarInternalCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
                 if dimLevel < 0 then
                     local targetSZD = (100 + dimLevel) / 100
-                    table.insert(lunarCmds, self:lunarCmd(serial, "subzero", true))
-                    table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", 1.0))
-                    table.insert(lunarCmds, "sleep 0.1")
-                    -- Stepped fade paced to roughly match gamma fade duration
-                    local steps = 5
+                    table.insert(lunarInternalCmds, self:lunarCmd(serial, "subzero", true))
+                    table.insert(lunarInternalCmds, self:lunarCmd(serial, "subzeroDimming", 1.0))
+                    table.insert(lunarInternalCmds, "sleep 0.1")
+                    -- More steps, no extra sleep — Lunar's ~250ms latency paces naturally
+                    -- 8 steps × ~250ms ≈ 2s, matching gamma fade duration
+                    local steps = 8
                     local gamma_exp = 2.2
-                    local from_p = 1.0  -- 1.0 ^ (1/2.2) = 1.0
+                    local from_p = 1.0
                     local to_p   = targetSZD ^ (1 / gamma_exp)
                     local lastVal = nil
                     for step = 1, steps do
@@ -367,11 +367,8 @@ function obj:dimScreens()
                         local raw = p_val ^ gamma_exp
                         local value = math.floor(raw * 100 + 0.5) / 100
                         if value ~= lastVal then
-                            table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", value))
+                            table.insert(lunarInternalCmds, self:lunarCmd(serial, "subzeroDimming", value))
                             lastVal = value
-                        end
-                        if step < steps then
-                            table.insert(lunarCmds, "sleep 0.15")
                         end
                     end
                 end
@@ -379,6 +376,8 @@ function obj:dimScreens()
                 -- External display: smooth gamma fade via setGamma
                 logAlways("Dim %s (%s…): brightness %d → level %d [priority %d] [gamma]",
                     d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
+
+                table.insert(lunarExternalCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
 
                 if dimLevel < 0 then
                     local targetWP = (100 + dimLevel) / 100
@@ -398,6 +397,11 @@ function obj:dimScreens()
                 end
             end
         end
+
+        -- Build Lunar script: internal first (time-critical), external adaptive last
+        local lunarCmds = {}
+        for _, cmd in ipairs(lunarInternalCmds) do table.insert(lunarCmds, cmd) end
+        for _, cmd in ipairs(lunarExternalCmds) do table.insert(lunarCmds, cmd) end
 
         -- Run Lunar script and gamma fade in parallel
         local pending = 0
@@ -455,10 +459,10 @@ function obj:restoreScreens()
             -- Internal: restore via Lunar CLI subzero fade
             if dimLevel < 0 then
                 local curSZD = (100 + dimLevel) / 100
-                local steps = 5
+                local steps = 8
                 local gamma_exp = 2.2
                 local from_p = curSZD ^ (1 / gamma_exp)
-                local to_p   = 1.0  -- 1.0 ^ (1/2.2) = 1.0
+                local to_p   = 1.0
                 local lastVal = nil
                 for step = 1, steps do
                     local progress = step / steps
@@ -468,9 +472,6 @@ function obj:restoreScreens()
                     if value ~= lastVal then
                         table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", value))
                         lastVal = value
-                    end
-                    if step < steps then
-                        table.insert(lunarCmds, "sleep 0.15")
                     end
                 end
                 -- Restore original subzero state
