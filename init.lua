@@ -56,6 +56,11 @@ obj.defaults = {
     -- Safety reset: force-restore if stuck in dimming/restoring state
     stuckTimeout      = 30,        -- seconds before force-reset (0 to disable)
 
+    -- Wake sequence
+    wakeDelay         = 2,         -- initial delay (seconds) before polling Lunar
+    wakePollInterval  = 1,         -- seconds between Lunar readiness checks
+    wakePollTimeout   = 15,        -- give up polling after this many seconds
+
     -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
 
@@ -557,6 +562,47 @@ function obj:checkStuck()
 end
 
 ----------------------------------------------------------------------
+-- Wake sequence: poll Lunar readiness before restoring
+----------------------------------------------------------------------
+
+function obj:restoreAfterWake()
+    if self.state ~= "dimmed" and self.state ~= "dimming" then return end
+
+    local startTime = hs.timer.secondsSinceEpoch()
+    logAlways("Wake: waiting %.0fs before polling Lunar", self.config.wakeDelay)
+
+    hs.timer.doAfter(self.config.wakeDelay, function()
+        if self.state ~= "dimmed" and self.state ~= "dimming" then return end
+        self:pollLunarAndRestore(startTime)
+    end)
+end
+
+function obj:pollLunarAndRestore(startTime)
+    if self.state ~= "dimmed" and self.state ~= "dimming" then return end
+
+    local elapsed = hs.timer.secondsSinceEpoch() - startTime
+    if elapsed >= self.config.wakeDelay + self.config.wakePollTimeout then
+        logAlways("Wake: Lunar poll timed out after %.0fs — force restoring", elapsed)
+        self:forceReset()
+        return
+    end
+
+    self:getDisplaysAsync(function(displays)
+        if self.state ~= "dimmed" and self.state ~= "dimming" then return end
+
+        if next(displays) then
+            logAlways("Wake: Lunar responsive after %.1fs — restoring", elapsed)
+            self:restoreScreens()
+        else
+            logAlways("Wake: Lunar not ready (%.1fs elapsed) — retrying", elapsed)
+            hs.timer.doAfter(self.config.wakePollInterval, function()
+                self:pollLunarAndRestore(startTime)
+            end)
+        end
+    end)
+end
+
+----------------------------------------------------------------------
 -- Activity detection & idle checking
 ----------------------------------------------------------------------
 
@@ -601,12 +647,8 @@ function obj:startWatchers()
 
     self.caffeinateWatcher = hs.caffeinate.watcher.new(function(event)
         if event == hs.caffeinate.watcher.systemDidWake then
-            logMsg(self, "System woke")
-            hs.timer.doAfter(3, function()
-                if self.state == "dimmed" or self.state == "dimming" then
-                    self:restoreScreens()
-                end
-            end)
+            logAlways("System woke")
+            self:restoreAfterWake()
         elseif event == hs.caffeinate.watcher.systemWillSleep then
             logMsg(self, "System sleeping")
             self:cancelFade()
