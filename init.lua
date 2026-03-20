@@ -921,8 +921,7 @@ function obj:stop()
     self:cancelFade()
     hs.screen.restoreGamma()
     self:stopWatchers()
-    for _, hk in ipairs(self.hotkeys) do hk:delete() end
-    self.hotkeys = {}
+    -- Hotkeys are intentionally NOT deleted here so toggle can re-enable
     logAlways("ScreenDimmer stopped")
     return self
 end
