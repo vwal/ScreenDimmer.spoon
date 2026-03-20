@@ -69,6 +69,11 @@ obj.defaults = {
     verifyRetries     = 2,         -- max retry attempts if brightness mismatch
     verifyTolerance   = 2,         -- acceptable brightness deviation (±)
 
+    -- Lunar health monitoring
+    lunarHealthInterval  = 30,     -- seconds between health checks (0 to disable)
+    lunarRestartCooldown = 120,    -- minimum seconds between auto-restart attempts
+    lunarAppName         = "Lunar",-- app name for 'open -a'
+
     -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
 
@@ -94,6 +99,9 @@ obj.lastScreensaverEvent = 0    -- for cooldown after screensaver events
 obj.activityTap       = nil
 obj.idleCheckTimer    = nil
 obj.stuckCheckTimer   = nil
+obj.lunarHealthTimer  = nil
+obj.lunarHealthTask   = nil      -- hs.task for health check probe
+obj.lastLunarRestart  = 0        -- timestamp of last auto-restart
 obj.caffeinateWatcher = nil
 obj.screenWatcher     = nil
 obj.hotkeys           = {}
@@ -658,6 +666,66 @@ function obj:checkStuck()
 end
 
 ----------------------------------------------------------------------
+-- Lunar health monitoring
+----------------------------------------------------------------------
+
+--- Check if Lunar process is running.
+function obj:isLunarRunning()
+    local output, status = hs.execute("pgrep -x Lunar")
+    return status == true
+end
+
+--- Attempt to restart Lunar.
+function obj:restartLunar()
+    local now = hs.timer.secondsSinceEpoch()
+    if now - self.lastLunarRestart < self.config.lunarRestartCooldown then
+        logAlways("Lunar restart skipped (cooldown: %.0fs remaining)",
+            self.config.lunarRestartCooldown - (now - self.lastLunarRestart))
+        return
+    end
+
+    self.lastLunarRestart = now
+    logAlways("Lunar not healthy — restarting")
+    hs.alert.show("ScreenDimmer: restarting Lunar")
+    hs.execute(string.format("open -a '%s'", self.config.lunarAppName))
+end
+
+--- Run a health check: process alive, then CLI responsive.
+function obj:checkLunarHealth()
+    if self.config.lunarHealthInterval <= 0 then return end
+
+    -- Step 1: Is the process running?
+    if not self:isLunarRunning() then
+        logAlways("Lunar health: process not running")
+        self:restartLunar()
+        return
+    end
+
+    -- Step 2: Is the CLI responsive? (async probe)
+    if self.lunarHealthTask and self.lunarHealthTask:isRunning() then
+        return  -- previous probe still running, skip this cycle
+    end
+
+    self.lunarHealthTask = hs.task.new(self.config.lunarPath,
+        function(exitCode, stdOut, stdErr)
+            self.lunarHealthTask = nil
+            if exitCode ~= 0 or not stdOut or stdOut == "" then
+                logAlways("Lunar health: CLI unresponsive (exit=%s)", tostring(exitCode))
+                -- Process is running but CLI failed — might be hung
+                if self:isLunarRunning() then
+                    logAlways("Lunar health: process alive but CLI hung — killing and restarting")
+                    hs.execute("pkill -x Lunar")
+                    hs.timer.doAfter(2, function() self:restartLunar() end)
+                else
+                    self:restartLunar()
+                end
+            end
+        end,
+        {"displays", "-j"})
+    self.lunarHealthTask:start()
+end
+
+----------------------------------------------------------------------
 -- Wake sequence: poll Lunar readiness before restoring
 ----------------------------------------------------------------------
 
@@ -745,6 +813,12 @@ function obj:startWatchers()
         end)
     end
 
+    if self.config.lunarHealthInterval > 0 then
+        self.lunarHealthTimer = hs.timer.doEvery(self.config.lunarHealthInterval, function()
+            self:checkLunarHealth()
+        end)
+    end
+
     self.caffeinateWatcher = hs.caffeinate.watcher.new(function(event)
         if event == hs.caffeinate.watcher.systemDidWake then
             logAlways("System woke")
@@ -805,6 +879,11 @@ function obj:stopWatchers()
     if self.activityTap       then self.activityTap:stop();       self.activityTap = nil       end
     if self.idleCheckTimer    then self.idleCheckTimer:stop();    self.idleCheckTimer = nil    end
     if self.stuckCheckTimer   then self.stuckCheckTimer:stop();   self.stuckCheckTimer = nil   end
+    if self.lunarHealthTimer  then self.lunarHealthTimer:stop();  self.lunarHealthTimer = nil  end
+    if self.lunarHealthTask   then
+        if self.lunarHealthTask:isRunning() then self.lunarHealthTask:terminate() end
+        self.lunarHealthTask = nil
+    end
     if self.caffeinateWatcher then self.caffeinateWatcher:stop(); self.caffeinateWatcher = nil end
     if self.screenWatcher     then self.screenWatcher:stop();     self.screenWatcher = nil     end
 end
