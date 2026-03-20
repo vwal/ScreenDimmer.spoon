@@ -979,6 +979,10 @@ function obj:bindHotkeys(mapping)
     return self
 end
 
+function obj:listDisplays()
+    dofile(hs.configdir .. "/Spoons/ScreenDimmer.spoon/list_displays.lua")
+end
+
 function obj:display(dimLevel, priority, minBrightness)
     local d = { dimLevel = dimLevel }
     if priority then d.priority = priority end
