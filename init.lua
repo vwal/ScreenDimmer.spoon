@@ -7,9 +7,12 @@
 --- ARCHITECTURE: Fully async. No hs.execute calls. All Lunar CLI interactions
 --- use hs.task.new with callbacks so the main Hammerspoon thread never blocks.
 --- Fades run as a single shell script process to prevent process pileup.
---- Each fade step runs all display commands in parallel (& wait) for
---- synchronized updates. adaptiveSubzero is disabled during fades to
---- prevent Lunar's adaptive algorithm from fighting our manual values.
+--- Displays are faded ONE AT A TIME in priority order, each through its
+--- full preamble → fade steps → postamble sequence. All Lunar commands
+--- are sequential (no backgrounding) since Lunar serializes CLI requests.
+--- adaptiveSubzero is disabled during fades to prevent Lunar's adaptive
+--- algorithm from fighting our manual values. Interpolation uses gamma-
+--- corrected perceptual space so each step looks like an equal change.
 ---
 --- Dim level convention:
 ---   Positive (1–100): hardware brightness target
@@ -35,7 +38,7 @@ local log = hs.logger.new("ScreenDimmer", "info")
 
 obj.defaults = {
     idleTimeout      = 300,      -- seconds before dimming
-    fadeSteps         = 7,       -- steps in fade animation
+    fadeSteps         = 5,       -- steps in fade animation
     fadeStepDelay     = 0,       -- 0 = no extra sleep; Lunar's latency paces the fade
     checkInterval     = 5,       -- idle-check frequency (seconds)
     lunarPath         = os.getenv("HOME") .. "/.local/bin/lunar",
@@ -152,23 +155,21 @@ function obj:getDimLevel(serial, isInternal)
     return isInternal and self.config.internalDimLevel or self.config.externalDimLevel
 end
 
+--- Resolve the priority for a display: per-display override → category default.
+function obj:getDisplayPriority(serial, isInternal)
+    local dc = self.config.displays[serial]
+    if dc and dc.priority then return dc.priority end
+    return isInternal and 100 or 200
+end
+
 ----------------------------------------------------------------------
 -- Fade engine
 --
--- Generates a complete shell script that performs the entire fade as
--- a SINGLE process. Each step runs Lunar commands in parallel (via &),
--- waits for completion, then sleeps. Uses trap to kill children on
--- cancellation.
+-- Generates a complete shell script that fades displays ONE AT A TIME,
+-- each through its full preamble → steps → postamble sequence, in
+-- priority order. All commands are sequential (no & or wait) since
+-- Lunar serializes CLI requests anyway.
 ----------------------------------------------------------------------
-
---- Cubic ease-in-out for smooth visual transitions.
-local function easeInOutCubic(t)
-    if t < 0.5 then
-        return 4 * t * t * t
-    else
-        return 1 - math.pow(-2 * t + 2, 3) / 2
-    end
-end
 
 --- Cancel the active fade task (and its child processes) if running.
 function obj:cancelFade()
@@ -186,83 +187,111 @@ function obj:cancelFade()
     end
 end
 
---- Build and run a fade as a single shell script.
+--- Build and run a per-display sequential fade as a single shell script.
 ---
---- `channels`: list of { serial, property, from, to }
---- `preambleCmds`: shell commands run before the fade (e.g., subzero enable)
---- `postambleCmds`: shell commands run after the fade (e.g., subzero disable)
+--- `displayFades`: ordered list of per-display fade specs:
+---   { serial, name, preambleCmds, channels: [{property, from, to}], postambleCmds }
 --- `callback`: function called when script finishes (or is cancelled)
-function obj:runFade(channels, preambleCmds, postambleCmds, callback)
+function obj:runFade(displayFades, callback)
     self:cancelFade()
 
     local steps     = self.config.fadeSteps
     local stepDelay = self.config.fadeStepDelay
+    local logging   = self.config.logging
     local lines     = {
-        "trap 'kill $(jobs -p) 2>/dev/null; exit 1' TERM INT",
+        "trap 'exit 1' TERM INT",
     }
-
-    -- Preamble: run per-display setup groups in parallel, then settle
-    if preambleCmds and #preambleCmds > 0 then
-        table.insert(lines, table.concat(preambleCmds, " & ") .. " & wait")
-        table.insert(lines, "sleep 0.1")
-    end
-
-    -- Pre-compute all step values, skipping redundant commands.
-    -- Commands run in parallel per step (& wait) so all displays
-    -- update at the same target level in each step.
-    local lastVals = {}
-    for i = 1, #channels do lastVals[i] = nil end
 
     local totalCmds = 0
     local stepLog = {}
-    for step = 1, steps do
-        local progress = step / steps  -- linear for consistent per-step changes
-        local cmds = {}
-        local vals = {}
 
-        for i, ch in ipairs(channels) do
-            local raw = ch.from + (ch.to - ch.from) * progress
-            local value
-            if ch.property == "brightness" then
-                value = math.floor(raw + 0.5)
-            else
-                value = math.floor(raw * 100 + 0.5) / 100
+    for _, df in ipairs(displayFades) do
+        if logging then
+            table.insert(lines, string.format(
+                "echo \"DISPLAY %s start $(date +%%H:%%M:%%S)\" >&2",
+                df.serial:sub(1, 4)))
+        end
+
+        -- Per-display preamble (sequential)
+        for _, cmd in ipairs(df.preambleCmds or {}) do
+            table.insert(lines, cmd)
+            totalCmds = totalCmds + 1
+        end
+        if df.preambleCmds and #df.preambleCmds > 0 then
+            table.insert(lines, "sleep 0.1")
+        end
+
+        -- Fade steps for this display (sequential)
+        local lastVals = {}
+        for i = 1, #df.channels do lastVals[i] = nil end
+
+        for step = 1, steps do
+            local progress = step / steps
+            local vals = {}
+            local emitted = 0
+
+            for i, ch in ipairs(df.channels) do
+                local raw
+                if ch.property == "subzeroDimming" then
+                    local gamma = 2.2
+                    local from_p = ch.from ^ (1 / gamma)
+                    local to_p   = ch.to   ^ (1 / gamma)
+                    local p_val  = from_p + (to_p - from_p) * progress
+                    raw = p_val ^ gamma
+                else
+                    raw = ch.from + (ch.to - ch.from) * progress
+                end
+
+                local value
+                if ch.property == "brightness" then
+                    value = math.floor(raw + 0.5)
+                else
+                    value = math.floor(raw * 100 + 0.5) / 100
+                end
+
+                table.insert(vals, string.format("%.2f", value))
+
+                if value ~= lastVals[i] then
+                    lastVals[i] = value
+                    table.insert(lines, self:lunarCmd(df.serial, ch.property, value))
+                    totalCmds = totalCmds + 1
+                    emitted = emitted + 1
+                end
             end
 
-            table.insert(vals, string.format("%s=%.2f", ch.serial:sub(1,4), value))
+            table.insert(stepLog, string.format("  %s step %2d (p=%.3f): %s%s",
+                df.serial:sub(1, 4), step, progress, table.concat(vals, ", "),
+                emitted > 0 and "" or " [skip]"))
 
-            if value ~= lastVals[i] then
-                lastVals[i] = value
-                table.insert(cmds, self:lunarCmd(ch.serial, ch.property, value))
+            if stepDelay > 0 and step < steps then
+                table.insert(lines, string.format("sleep %.3f", stepDelay))
             end
         end
 
-        if #cmds > 0 then
-            table.insert(lines, table.concat(cmds, " & ") .. " & wait")
-            totalCmds = totalCmds + #cmds
+        -- Per-display postamble (sequential)
+        for _, cmd in ipairs(df.postambleCmds or {}) do
+            table.insert(lines, cmd)
+            totalCmds = totalCmds + 1
         end
 
-        table.insert(stepLog, string.format("  step %2d (p=%.3f): %s [%d cmds]",
-            step, progress, table.concat(vals, ", "), #cmds))
-
-        if stepDelay > 0 and step < steps then
-            table.insert(lines, string.format("sleep %.3f", stepDelay))
+        if logging then
+            table.insert(lines, string.format(
+                "echo \"DISPLAY %s done  $(date +%%H:%%M:%%S)\" >&2",
+                df.serial:sub(1, 4)))
         end
-    end
-
-    -- Postamble: run cleanup commands in parallel
-    if postambleCmds and #postambleCmds > 0 then
-        table.insert(lines, table.concat(postambleCmds, " & ") .. " & wait")
     end
 
     local script = table.concat(lines, "\n")
 
-    logAlways("Fade: %d channels, %d steps, %d total cmds, %d script lines",
-        #channels, steps, totalCmds, #lines)
+    logAlways("Fade: %d displays, %d steps/display, %d total cmds, %d script lines",
+        #displayFades, steps, totalCmds, #lines)
     logAlways("Fade steps:\n%s", table.concat(stepLog, "\n"))
 
     self.fadeTask = hs.task.new("/bin/sh", function(exitCode, stdOut, stdErr)
         self.fadeTask = nil
+        if stdErr and stdErr ~= "" then
+            logAlways("Fade timing:\n%s", stdErr)
+        end
         if callback then callback(exitCode == 0) end
     end, {"-c", script})
     self.fadeTask:start()
@@ -290,10 +319,25 @@ function obj:dimScreens()
             return
         end
 
-        local preambleCmds = {}
-        local channels = {}
-
+        -- Build sorted list of displays by priority
+        local displayList = {}
         for serial, d in pairs(displays) do
+            table.insert(displayList, {
+                serial   = serial,
+                info     = d,
+                priority = self:getDisplayPriority(serial, d.isInternal),
+            })
+        end
+        table.sort(displayList, function(a, b)
+            if a.priority ~= b.priority then return a.priority < b.priority end
+            return a.serial < b.serial
+        end)
+
+        -- Build per-display fade specs
+        local displayFades = {}
+        for _, entry in ipairs(displayList) do
+            local serial = entry.serial
+            local d = entry.info
             local dimLevel = self:getDimLevel(serial, d.isInternal)
 
             self.savedState[serial] = {
@@ -301,37 +345,37 @@ function obj:dimScreens()
                 subzero        = d.subzero,
                 subzeroDimming = d.subzeroDimming,
                 isInternal     = d.isInternal,
+                name           = d.name,
             }
 
-            logAlways("Dim %s (%s…): brightness %d → level %d",
-                d.name, serial:sub(1, 8), d.brightness, dimLevel)
+            logAlways("Dim %s (%s…): brightness %d → level %d [priority %d]",
+                d.name, serial:sub(1, 8), d.brightness, dimLevel, entry.priority)
 
             if dimLevel < 0 then
                 local targetSZD = (100 + dimLevel) / 100
-
-                -- Preamble per display (grouped with && so they run in order):
-                --   1. Set subzeroDimming=1.0 first (no visible effect yet)
-                --   2. Disable adaptiveSubzero so Lunar doesn't fight our fade
-                --   3. Enable subzero mode (at level 1.0 = no visible dimming)
-                local szdCmd   = self:lunarCmd(serial, "subzeroDimming", 1.0)
-                local adaptCmd = self:lunarCmd(serial, "adaptiveSubzero", false)
-                local szCmd    = self:lunarCmd(serial, "subzero", true)
-                table.insert(preambleCmds,
-                    "(" .. szdCmd .. " && " .. adaptCmd .. " && " .. szCmd .. ")")
-
-                -- Only fade subzeroDimming — don't touch hardware brightness.
-                -- Changing both causes flashing (Lunar's adaptive brightness
-                -- fights our brightness changes). Hardware brightness alone
-                -- can't go below 0, and brightness=0 means backlight off = black.
-                table.insert(channels, { serial = serial, property = "subzeroDimming",
-                    from = 1.0, to = targetSZD })
+                table.insert(displayFades, {
+                    serial = serial,
+                    name = d.name,
+                    preambleCmds = {
+                        self:lunarCmd(serial, "adaptiveSubzero", false),
+                        self:lunarCmd(serial, "subzero", true),
+                        self:lunarCmd(serial, "subzeroDimming", 1.0),
+                    },
+                    channels = { { property = "subzeroDimming", from = 1.0, to = targetSZD } },
+                    postambleCmds = {},
+                })
             else
-                table.insert(channels, { serial = serial, property = "brightness",
-                    from = d.brightness, to = dimLevel })
+                table.insert(displayFades, {
+                    serial = serial,
+                    name = d.name,
+                    preambleCmds = {},
+                    channels = { { property = "brightness", from = d.brightness, to = dimLevel } },
+                    postambleCmds = {},
+                })
             end
         end
 
-        self:runFade(channels, preambleCmds, nil, function(ok)
+        self:runFade(displayFades, function(ok)
             if self.state == "dimming" then
                 self.state = "dimmed"
                 logAlways("All displays dimmed")
@@ -360,37 +404,34 @@ function obj:restoreScreens()
     self:getDisplaysAsync(function(currentDisplays)
         if self.state ~= "restoring" then return end
 
-        local channels = {}
-        local restorePreambleCmds = {}
-
+        -- Build sorted list by priority (same order as dim)
+        local displayList = {}
         for serial, saved in pairs(self.savedState) do
+            table.insert(displayList, {
+                serial   = serial,
+                saved    = saved,
+                priority = self:getDisplayPriority(serial, saved.isInternal),
+            })
+        end
+        table.sort(displayList, function(a, b)
+            if a.priority ~= b.priority then return a.priority < b.priority end
+            return a.serial < b.serial
+        end)
+
+        -- Build per-display fade specs
+        local displayFades = {}
+        for _, entry in ipairs(displayList) do
+            local serial = entry.serial
+            local saved = entry.saved
             local dimLevel = self:getDimLevel(serial, saved.isInternal)
             local cur = currentDisplays[serial]
 
-            logAlways("Restore %s… → brightness %d", serial:sub(1, 8), saved.brightness)
+            logAlways("Restore %s (%s…) → brightness %d [priority %d]",
+                saved.name or "?", serial:sub(1, 8), saved.brightness, entry.priority)
 
             if dimLevel < 0 then
                 local curSZD = (cur and cur.subzeroDimming) or (100 + dimLevel) / 100
-
-                -- Ensure adaptive is off during restore fade too
-                table.insert(restorePreambleCmds,
-                    self:lunarCmd(serial, "adaptiveSubzero", false))
-
-                -- Only restore subzeroDimming (brightness was never changed)
-                table.insert(channels, { serial = serial, property = "subzeroDimming",
-                    from = curSZD, to = 1.0 })
-            else
-                local curBr = (cur and cur.brightness) or dimLevel
-                table.insert(channels, { serial = serial, property = "brightness",
-                    from = curBr, to = saved.brightness })
-            end
-        end
-
-        -- Postamble: clean up subzero state and re-enable adaptive
-        local postCmds = {}
-        for serial, saved in pairs(self.savedState) do
-            local dimLevel = self:getDimLevel(serial, saved.isInternal)
-            if dimLevel < 0 then
+                local postCmds = {}
                 if saved.subzero then
                     table.insert(postCmds,
                         self:lunarCmd(serial, "subzeroDimming", saved.subzeroDimming))
@@ -398,13 +439,31 @@ function obj:restoreScreens()
                     table.insert(postCmds,
                         self:lunarCmd(serial, "subzero", false))
                 end
-                -- Re-enable adaptive subzero control
                 table.insert(postCmds,
                     self:lunarCmd(serial, "adaptiveSubzero", true))
+
+                table.insert(displayFades, {
+                    serial = serial,
+                    name = saved.name or serial,
+                    preambleCmds = {
+                        self:lunarCmd(serial, "adaptiveSubzero", false),
+                    },
+                    channels = { { property = "subzeroDimming", from = curSZD, to = 1.0 } },
+                    postambleCmds = postCmds,
+                })
+            else
+                local curBr = (cur and cur.brightness) or dimLevel
+                table.insert(displayFades, {
+                    serial = serial,
+                    name = saved.name or serial,
+                    preambleCmds = {},
+                    channels = { { property = "brightness", from = curBr, to = saved.brightness } },
+                    postambleCmds = {},
+                })
             end
         end
 
-        self:runFade(channels, restorePreambleCmds, postCmds, function(ok)
+        self:runFade(displayFades, function(ok)
             self.state = "idle"
             logAlways("All displays restored")
         end)
@@ -560,8 +619,10 @@ function obj:bindHotkeys(mapping)
     return self
 end
 
-function obj:display(dimLevel)
-    return { dimLevel = dimLevel }
+function obj:display(dimLevel, priority)
+    local d = { dimLevel = dimLevel }
+    if priority then d.priority = priority end
+    return d
 end
 
 return obj
