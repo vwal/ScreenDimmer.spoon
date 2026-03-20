@@ -1,24 +1,27 @@
 --- === ScreenDimmer ===
 ---
---- Dims screens after inactivity using Lunar Pro, with smooth fade transitions.
---- Supports subzero (gamma) dimming for deeper-than-hardware dim levels.
+--- Dims screens after inactivity using smooth gamma fades, with Lunar Pro
+--- for state management. Supports deep subzero dimming levels.
 --- Each display can be configured individually or by category (internal/external).
 ---
---- ARCHITECTURE: Fully async. No hs.execute calls. All Lunar CLI interactions
---- use hs.task.new with callbacks so the main Hammerspoon thread never blocks.
---- Fades run as a single shell script process to prevent process pileup.
---- Displays are faded ONE AT A TIME in priority order, each through its
---- full preamble → fade steps → postamble sequence. All Lunar commands
---- are sequential (no backgrounding) since Lunar serializes CLI requests.
---- adaptiveSubzero is disabled during fades to prevent Lunar's adaptive
---- algorithm from fighting our manual values. Interpolation uses gamma-
---- corrected perceptual space so each step looks like an equal change.
+--- ARCHITECTURE:
+---   External displays use hs.screen:setGamma() at ~30fps for buttery
+---   smooth transitions, all fading simultaneously. The gamma overlay stays
+---   applied while dimmed (no handoff to Lunar subzero).
+---   Internal (built-in) display uses Lunar CLI subzero fade (macOS protects
+---   the internal display's gamma table, so setGamma() is ineffective).
+---   Both paths run in parallel so the internal display fades at the same
+---   time as externals. Lunar CLI is also used to disable adaptiveSubzero
+---   during dimming (prevent interference) and re-enable it on restore.
+---
+---   Display mapping: hs.screen:getUUID() matches Lunar's display serial
+---   (both use CGDisplayCreateUUIDFromDisplayID internally).
 ---
 --- Dim level convention:
 ---   Positive (1–100): hardware brightness target
 ---   Zero: hardware brightness 0
----   Negative (-1 to -100): subzero dimming via Lunar's gamma overlay
----     Formula: subzeroDimming = (100 + dimLevel) / 100
+---   Negative (-1 to -100): subzero dimming via gamma overlay
+---     Formula: whitepoint = (100 + dimLevel) / 100
 ---     Examples: -30 → 0.70, -80 → 0.20, -99 → 0.01
 
 local obj = {}
@@ -26,7 +29,7 @@ obj.__index = obj
 
 -- Spoon metadata
 obj.name = "ScreenDimmer"
-obj.version = "1.0"
+obj.version = "2.0"
 obj.author = ""
 obj.license = "MIT"
 
@@ -38,19 +41,19 @@ local log = hs.logger.new("ScreenDimmer", "info")
 
 obj.defaults = {
     idleTimeout      = 300,      -- seconds before dimming
-    fadeSteps         = 5,       -- steps in fade animation
-    fadeStepDelay     = 0,       -- 0 = no extra sleep; Lunar's latency paces the fade
-    checkInterval     = 5,       -- idle-check frequency (seconds)
-    lunarPath         = os.getenv("HOME") .. "/.local/bin/lunar",
+    fadeDuration     = 2.0,      -- seconds for smooth gamma fade
+    fadeInterval     = 0.033,    -- ~30fps gamma updates
+    checkInterval    = 5,        -- idle-check frequency (seconds)
+    lunarPath        = os.getenv("HOME") .. "/.local/bin/lunar",
 
     -- Category defaults for dim level
     internalDimLevel  = -30,     -- built-in display
     externalDimLevel  = -80,     -- external displays
 
-    -- Per-display overrides keyed by Lunar serial
+    -- Per-display overrides keyed by Lunar serial (= hs.screen UUID)
     displays          = {},
 
-    logging           = true,   -- TODO: set to false once fade is tuned
+    logging           = true,    -- TODO: set to false once tuned
 }
 
 ----------------------------------------------------------------------
@@ -59,8 +62,10 @@ obj.defaults = {
 
 obj.config            = {}
 obj.state             = "idle"   -- idle | dimming | dimmed | restoring
-obj.savedState        = {}       -- per-serial saved brightness before dim
-obj.fadeTask          = nil      -- single hs.task running the fade script
+obj.savedState        = {}       -- per-UUID: { brightness, subzero, subzeroDimming, ... }
+obj.savedGamma        = {}       -- per-UUID: { whitepoint, blackpoint } from getGamma()
+obj.fadeTimer         = nil      -- hs.timer driving the gamma animation
+obj.fadeTask          = nil      -- hs.task for Lunar CLI commands
 obj.queryTask         = nil      -- hs.task for async display queries
 obj.enabled           = false
 obj.dimStartTime      = 0        -- for activity cooldown
@@ -105,11 +110,29 @@ function obj:lunarCmd(serial, property, value)
     return string.format('%s displays "%s" %s %s', self.config.lunarPath, serial, property, v)
 end
 
+--- Run a list of shell commands as a single script (async, non-blocking).
+function obj:runLunarScript(cmds, callback)
+    if self.fadeTask and self.fadeTask:isRunning() then
+        self.fadeTask:terminate()
+    end
+
+    if #cmds == 0 then
+        if callback then callback(true) end
+        return
+    end
+
+    local script = table.concat(cmds, "\n")
+    logMsg(self, "Lunar script (%d cmds):\n%s", #cmds, script)
+
+    self.fadeTask = hs.task.new("/bin/sh", function(exitCode, stdOut, stdErr)
+        self.fadeTask = nil
+        if callback then callback(exitCode == 0) end
+    end, {"-c", script})
+    self.fadeTask:start()
+end
+
 --- Query Lunar for all active displays via JSON (ASYNC, non-blocking).
---- Calls callback(displays) where displays is { serial → { name, isInternal, ... } }.
---- Returns empty table on failure.
 function obj:getDisplaysAsync(callback)
-    -- Cancel any outstanding query
     if self.queryTask and self.queryTask:isRunning() then
         self.queryTask:terminate()
     end
@@ -148,14 +171,14 @@ function obj:getDisplaysAsync(callback)
     self.queryTask:start()
 end
 
---- Resolve the dim level for a display: per-display override → category default.
+--- Resolve the dim level for a display.
 function obj:getDimLevel(serial, isInternal)
     local dc = self.config.displays[serial]
     if dc and dc.dimLevel then return dc.dimLevel end
     return isInternal and self.config.internalDimLevel or self.config.externalDimLevel
 end
 
---- Resolve the priority for a display: per-display override → category default.
+--- Resolve the priority for a display.
 function obj:getDisplayPriority(serial, isInternal)
     local dc = self.config.displays[serial]
     if dc and dc.priority then return dc.priority end
@@ -163,16 +186,19 @@ function obj:getDisplayPriority(serial, isInternal)
 end
 
 ----------------------------------------------------------------------
--- Fade engine
+-- Smooth gamma fade engine
 --
--- Generates a complete shell script that fades displays ONE AT A TIME,
--- each through its full preamble → steps → postamble sequence, in
--- priority order. All commands are sequential (no & or wait) since
--- Lunar serializes CLI requests anyway.
+-- Uses hs.screen:setGamma() at ~30fps for buttery smooth transitions.
+-- All displays are faded simultaneously — no CLI latency bottleneck.
+-- Gamma whitepoint {r,g,b} = uniform value from 1.0 (normal) to target.
 ----------------------------------------------------------------------
 
---- Cancel the active fade task (and its child processes) if running.
+--- Cancel any active fade (timer + Lunar task).
 function obj:cancelFade()
+    if self.fadeTimer then
+        self.fadeTimer:stop()
+        self.fadeTimer = nil
+    end
     if self.fadeTask then
         if self.fadeTask:isRunning() then
             self.fadeTask:terminate()
@@ -187,114 +213,90 @@ function obj:cancelFade()
     end
 end
 
---- Build and run a per-display sequential fade as a single shell script.
+--- Find the hs.screen object for a given UUID.
+local function screenForUUID(uuid)
+    for _, s in ipairs(hs.screen.allScreens()) do
+        if s:getUUID() == uuid then return s end
+    end
+    return nil
+end
+
+--- Run a smooth gamma fade across all displays simultaneously.
 ---
---- `displayFades`: ordered list of per-display fade specs:
----   { serial, name, preambleCmds, channels: [{property, from, to}], postambleCmds }
---- `callback`: function called when script finishes (or is cancelled)
-function obj:runFade(displayFades, callback)
-    self:cancelFade()
+--- `targets`: list of { uuid, fromWP, toWP }
+---   fromWP/toWP are whitepoint values (0.0–1.0).
+--- `callback`: called when fade animation completes.
+function obj:runGammaFade(targets, callback)
+    -- Cancel any active fade
+    if self.fadeTimer then
+        self.fadeTimer:stop()
+        self.fadeTimer = nil
+    end
 
-    local steps     = self.config.fadeSteps
-    local stepDelay = self.config.fadeStepDelay
-    local logging   = self.config.logging
-    local lines     = {
-        "trap 'exit 1' TERM INT",
-    }
+    local duration = self.config.fadeDuration
+    local interval = self.config.fadeInterval
+    local gamma    = 2.2  -- perceptual correction
+    local startTime = hs.timer.secondsSinceEpoch()
+    local logging = self.config.logging
 
-    local totalCmds = 0
-    local stepLog = {}
-
-    for _, df in ipairs(displayFades) do
-        if logging then
-            table.insert(lines, string.format(
-                "echo \"DISPLAY %s start $(date +%%H:%%M:%%S)\" >&2",
-                df.serial:sub(1, 4)))
-        end
-
-        -- Per-display preamble (sequential)
-        for _, cmd in ipairs(df.preambleCmds or {}) do
-            table.insert(lines, cmd)
-            totalCmds = totalCmds + 1
-        end
-        if df.preambleCmds and #df.preambleCmds > 0 then
-            table.insert(lines, "sleep 0.1")
-        end
-
-        -- Fade steps for this display (sequential)
-        local lastVals = {}
-        for i = 1, #df.channels do lastVals[i] = nil end
-
-        for step = 1, steps do
-            local progress = step / steps
-            local vals = {}
-            local emitted = 0
-
-            for i, ch in ipairs(df.channels) do
-                local raw
-                if ch.property == "subzeroDimming" then
-                    local gamma = 2.2
-                    local from_p = ch.from ^ (1 / gamma)
-                    local to_p   = ch.to   ^ (1 / gamma)
-                    local p_val  = from_p + (to_p - from_p) * progress
-                    raw = p_val ^ gamma
-                else
-                    raw = ch.from + (ch.to - ch.from) * progress
-                end
-
-                local value
-                if ch.property == "brightness" then
-                    value = math.floor(raw + 0.5)
-                else
-                    value = math.floor(raw * 100 + 0.5) / 100
-                end
-
-                table.insert(vals, string.format("%.2f", value))
-
-                if value ~= lastVals[i] then
-                    lastVals[i] = value
-                    table.insert(lines, self:lunarCmd(df.serial, ch.property, value))
-                    totalCmds = totalCmds + 1
-                    emitted = emitted + 1
-                end
-            end
-
-            table.insert(stepLog, string.format("  %s step %2d (p=%.3f): %s%s",
-                df.serial:sub(1, 4), step, progress, table.concat(vals, ", "),
-                emitted > 0 and "" or " [skip]"))
-
-            if stepDelay > 0 and step < steps then
-                table.insert(lines, string.format("sleep %.3f", stepDelay))
-            end
-        end
-
-        -- Per-display postamble (sequential)
-        for _, cmd in ipairs(df.postambleCmds or {}) do
-            table.insert(lines, cmd)
-            totalCmds = totalCmds + 1
-        end
-
-        if logging then
-            table.insert(lines, string.format(
-                "echo \"DISPLAY %s done  $(date +%%H:%%M:%%S)\" >&2",
-                df.serial:sub(1, 4)))
+    -- Pre-resolve screen objects
+    local fadeEntries = {}
+    for _, t in ipairs(targets) do
+        local screen = screenForUUID(t.uuid)
+        if screen then
+            -- Perceptual linearization of endpoints
+            local from_p = t.fromWP ^ (1 / gamma)
+            local to_p   = t.toWP   ^ (1 / gamma)
+            table.insert(fadeEntries, {
+                screen = screen,
+                uuid   = t.uuid,
+                from_p = from_p,
+                to_p   = to_p,
+                toWP   = t.toWP,
+            })
+        else
+            logAlways("No hs.screen for UUID %s — skipping gamma fade", t.uuid)
         end
     end
 
-    local script = table.concat(lines, "\n")
+    if #fadeEntries == 0 then
+        logAlways("No screens to fade")
+        if callback then callback() end
+        return
+    end
 
-    logAlways("Fade: %d displays, %d steps/display, %d total cmds, %d script lines",
-        #displayFades, steps, totalCmds, #lines)
-    logAlways("Fade steps:\n%s", table.concat(stepLog, "\n"))
-
-    self.fadeTask = hs.task.new("/bin/sh", function(exitCode, stdOut, stdErr)
-        self.fadeTask = nil
-        if stdErr and stdErr ~= "" then
-            logAlways("Fade timing:\n%s", stdErr)
+    if logging then
+        local names = {}
+        for _, e in ipairs(fadeEntries) do
+            table.insert(names, string.format("%s (%.2f→%.2f)",
+                e.uuid:sub(1, 4), (e.from_p ^ gamma), e.toWP))
         end
-        if callback then callback(exitCode == 0) end
-    end, {"-c", script})
-    self.fadeTask:start()
+        logAlways("Gamma fade: %s over %.1fs", table.concat(names, ", "), duration)
+    end
+
+    self.fadeTimer = hs.timer.doEvery(interval, function()
+        local elapsed = hs.timer.secondsSinceEpoch() - startTime
+        local progress = math.min(elapsed / duration, 1.0)
+
+        for _, e in ipairs(fadeEntries) do
+            -- Interpolate in perceptual space, convert back to raw
+            local p_val = e.from_p + (e.to_p - e.from_p) * progress
+            local wp = p_val ^ gamma
+            e.screen:setGamma(
+                { red = wp, green = wp, blue = wp },
+                { red = 0,  green = 0,  blue = 0 }
+            )
+        end
+
+        if progress >= 1.0 then
+            self.fadeTimer:stop()
+            self.fadeTimer = nil
+            if logging then
+                logAlways("Gamma fade complete (%.1fs)", elapsed)
+            end
+            if callback then callback() end
+        end
+    end)
 end
 
 ----------------------------------------------------------------------
@@ -308,9 +310,9 @@ function obj:dimScreens()
     self.state = "dimming"
     self.dimStartTime = hs.timer.secondsSinceEpoch()
     self.savedState = {}
+    self.savedGamma = {}
 
     self:getDisplaysAsync(function(displays)
-        -- Guard: state may have changed while waiting for async query
         if self.state ~= "dimming" then return end
 
         if not next(displays) then
@@ -319,26 +321,13 @@ function obj:dimScreens()
             return
         end
 
-        -- Build sorted list of displays by priority
-        local displayList = {}
-        for serial, d in pairs(displays) do
-            table.insert(displayList, {
-                serial   = serial,
-                info     = d,
-                priority = self:getDisplayPriority(serial, d.isInternal),
-            })
-        end
-        table.sort(displayList, function(a, b)
-            if a.priority ~= b.priority then return a.priority < b.priority end
-            return a.serial < b.serial
-        end)
+        -- Separate displays into gamma targets (external) and Lunar targets (internal)
+        local gammaTargets = {}
+        local lunarCmds = {}
 
-        -- Build per-display fade specs
-        local displayFades = {}
-        for _, entry in ipairs(displayList) do
-            local serial = entry.serial
-            local d = entry.info
+        for serial, d in pairs(displays) do
             local dimLevel = self:getDimLevel(serial, d.isInternal)
+            local priority = self:getDisplayPriority(serial, d.isInternal)
 
             self.savedState[serial] = {
                 brightness     = d.brightness,
@@ -348,39 +337,92 @@ function obj:dimScreens()
                 name           = d.name,
             }
 
-            logAlways("Dim %s (%s…): brightness %d → level %d [priority %d]",
-                d.name, serial:sub(1, 8), d.brightness, dimLevel, entry.priority)
+            local screen = screenForUUID(serial)
+            if screen then
+                self.savedGamma[serial] = screen:getGamma()
+            end
 
-            if dimLevel < 0 then
-                local targetSZD = (100 + dimLevel) / 100
-                table.insert(displayFades, {
-                    serial = serial,
-                    name = d.name,
-                    preambleCmds = {
-                        self:lunarCmd(serial, "adaptiveSubzero", false),
-                        self:lunarCmd(serial, "subzero", true),
-                        self:lunarCmd(serial, "subzeroDimming", 1.0),
-                    },
-                    channels = { { property = "subzeroDimming", from = 1.0, to = targetSZD } },
-                    postambleCmds = {},
-                })
+            -- Disable adaptive for all displays
+            table.insert(lunarCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
+
+            if d.isInternal then
+                -- Internal display: setGamma doesn't work, use Lunar CLI subzero
+                logAlways("Dim %s (%s…): brightness %d → level %d [priority %d] [Lunar]",
+                    d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
+
+                if dimLevel < 0 then
+                    local targetSZD = (100 + dimLevel) / 100
+                    table.insert(lunarCmds, self:lunarCmd(serial, "subzero", true))
+                    table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", 1.0))
+                    table.insert(lunarCmds, "sleep 0.1")
+                    -- Stepped fade paced to roughly match gamma fade duration
+                    local steps = 5
+                    local gamma_exp = 2.2
+                    local from_p = 1.0  -- 1.0 ^ (1/2.2) = 1.0
+                    local to_p   = targetSZD ^ (1 / gamma_exp)
+                    local lastVal = nil
+                    for step = 1, steps do
+                        local progress = step / steps
+                        local p_val = from_p + (to_p - from_p) * progress
+                        local raw = p_val ^ gamma_exp
+                        local value = math.floor(raw * 100 + 0.5) / 100
+                        if value ~= lastVal then
+                            table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", value))
+                            lastVal = value
+                        end
+                        if step < steps then
+                            table.insert(lunarCmds, "sleep 0.15")
+                        end
+                    end
+                end
             else
-                table.insert(displayFades, {
-                    serial = serial,
-                    name = d.name,
-                    preambleCmds = {},
-                    channels = { { property = "brightness", from = d.brightness, to = dimLevel } },
-                    postambleCmds = {},
-                })
+                -- External display: smooth gamma fade via setGamma
+                logAlways("Dim %s (%s…): brightness %d → level %d [priority %d] [gamma]",
+                    d.name, serial:sub(1, 8), d.brightness, dimLevel, priority)
+
+                if dimLevel < 0 then
+                    local targetWP = (100 + dimLevel) / 100
+                    table.insert(gammaTargets, {
+                        uuid   = serial,
+                        fromWP = 1.0,
+                        toWP   = targetWP,
+                    })
+                else
+                    local targetWP = dimLevel / math.max(d.brightness, 1)
+                    targetWP = math.max(0.01, math.min(1.0, targetWP))
+                    table.insert(gammaTargets, {
+                        uuid   = serial,
+                        fromWP = 1.0,
+                        toWP   = targetWP,
+                    })
+                end
             end
         end
 
-        self:runFade(displayFades, function(ok)
-            if self.state == "dimming" then
+        -- Run Lunar script and gamma fade in parallel
+        local pending = 0
+        local function onPartDone()
+            pending = pending - 1
+            if pending == 0 and self.state == "dimming" then
                 self.state = "dimmed"
                 logAlways("All displays dimmed")
             end
-        end)
+        end
+
+        if #lunarCmds > 0 then
+            pending = pending + 1
+            self:runLunarScript(lunarCmds, function(ok) onPartDone() end)
+        end
+
+        if #gammaTargets > 0 then
+            pending = pending + 1
+            self:runGammaFade(gammaTargets, function() onPartDone() end)
+        end
+
+        if pending == 0 then
+            self.state = "dimmed"
+            logAlways("Nothing to dim")
+        end
     end)
 end
 
@@ -397,77 +439,111 @@ function obj:restoreScreens()
 
     if not next(self.savedState) then
         logAlways("No saved state to restore from")
+        hs.screen.restoreGamma()
         self.state = "idle"
         return
     end
 
-    self:getDisplaysAsync(function(currentDisplays)
-        if self.state ~= "restoring" then return end
+    -- Separate into gamma targets (external) and Lunar targets (internal)
+    local gammaTargets = {}
+    local lunarCmds = {}
 
-        -- Build sorted list by priority (same order as dim)
-        local displayList = {}
-        for serial, saved in pairs(self.savedState) do
-            table.insert(displayList, {
-                serial   = serial,
-                saved    = saved,
-                priority = self:getDisplayPriority(serial, saved.isInternal),
+    for serial, saved in pairs(self.savedState) do
+        local dimLevel = self:getDimLevel(serial, saved.isInternal)
+
+        if saved.isInternal then
+            -- Internal: restore via Lunar CLI subzero fade
+            if dimLevel < 0 then
+                local curSZD = (100 + dimLevel) / 100
+                local steps = 5
+                local gamma_exp = 2.2
+                local from_p = curSZD ^ (1 / gamma_exp)
+                local to_p   = 1.0  -- 1.0 ^ (1/2.2) = 1.0
+                local lastVal = nil
+                for step = 1, steps do
+                    local progress = step / steps
+                    local p_val = from_p + (to_p - from_p) * progress
+                    local raw = p_val ^ gamma_exp
+                    local value = math.floor(raw * 100 + 0.5) / 100
+                    if value ~= lastVal then
+                        table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", value))
+                        lastVal = value
+                    end
+                    if step < steps then
+                        table.insert(lunarCmds, "sleep 0.15")
+                    end
+                end
+                -- Restore original subzero state
+                if saved.subzero then
+                    table.insert(lunarCmds, self:lunarCmd(serial, "subzeroDimming", saved.subzeroDimming))
+                else
+                    table.insert(lunarCmds, self:lunarCmd(serial, "subzero", false))
+                end
+            end
+            table.insert(lunarCmds, self:lunarCmd(serial, "adaptiveSubzero", true))
+        else
+            -- External: smooth gamma fade back to 1.0
+            local fromWP
+            if dimLevel < 0 then
+                fromWP = (100 + dimLevel) / 100
+            else
+                fromWP = dimLevel / math.max(saved.brightness, 1)
+                fromWP = math.max(0.01, math.min(1.0, fromWP))
+            end
+            table.insert(gammaTargets, {
+                uuid   = serial,
+                fromWP = fromWP,
+                toWP   = 1.0,
             })
         end
-        table.sort(displayList, function(a, b)
-            if a.priority ~= b.priority then return a.priority < b.priority end
-            return a.serial < b.serial
-        end)
+    end
 
-        -- Build per-display fade specs
-        local displayFades = {}
-        for _, entry in ipairs(displayList) do
-            local serial = entry.serial
-            local saved = entry.saved
-            local dimLevel = self:getDimLevel(serial, saved.isInternal)
-            local cur = currentDisplays[serial]
-
-            logAlways("Restore %s (%s…) → brightness %d [priority %d]",
-                saved.name or "?", serial:sub(1, 8), saved.brightness, entry.priority)
-
-            if dimLevel < 0 then
-                local curSZD = (cur and cur.subzeroDimming) or (100 + dimLevel) / 100
-                local postCmds = {}
-                if saved.subzero then
-                    table.insert(postCmds,
-                        self:lunarCmd(serial, "subzeroDimming", saved.subzeroDimming))
-                else
-                    table.insert(postCmds,
-                        self:lunarCmd(serial, "subzero", false))
-                end
-                table.insert(postCmds,
-                    self:lunarCmd(serial, "adaptiveSubzero", true))
-
-                table.insert(displayFades, {
-                    serial = serial,
-                    name = saved.name or serial,
-                    preambleCmds = {
-                        self:lunarCmd(serial, "adaptiveSubzero", false),
-                    },
-                    channels = { { property = "subzeroDimming", from = curSZD, to = 1.0 } },
-                    postambleCmds = postCmds,
-                })
-            else
-                local curBr = (cur and cur.brightness) or dimLevel
-                table.insert(displayFades, {
-                    serial = serial,
-                    name = saved.name or serial,
-                    preambleCmds = {},
-                    channels = { { property = "brightness", from = curBr, to = saved.brightness } },
-                    postambleCmds = {},
-                })
-            end
+    -- Add adaptiveSubzero true for external displays (after gamma fade completes)
+    local externalSerials = {}
+    for serial, saved in pairs(self.savedState) do
+        if not saved.isInternal then
+            table.insert(externalSerials, serial)
         end
+    end
 
-        self:runFade(displayFades, function(ok)
+    -- Run Lunar script and gamma fade in parallel
+    local pending = 0
+    local function onPartDone()
+        pending = pending - 1
+        if pending == 0 and self.state == "restoring" then
+            hs.screen.restoreGamma()
+            -- Re-enable adaptive for external displays
+            if #externalSerials > 0 then
+                local cmds = {}
+                for _, serial in ipairs(externalSerials) do
+                    table.insert(cmds, self:lunarCmd(serial, "adaptiveSubzero", true))
+                end
+                self:runLunarScript(cmds, nil)
+            end
             self.state = "idle"
+            self.savedState = {}
+            self.savedGamma = {}
             logAlways("All displays restored")
-        end)
-    end)
+        end
+    end
+
+    if #lunarCmds > 0 then
+        pending = pending + 1
+        self:runLunarScript(lunarCmds, function(ok) onPartDone() end)
+    end
+
+    if #gammaTargets > 0 then
+        pending = pending + 1
+        self:runGammaFade(gammaTargets, function() onPartDone() end)
+    end
+
+    if pending == 0 then
+        hs.screen.restoreGamma()
+        self.state = "idle"
+        self.savedState = {}
+        self.savedGamma = {}
+        logAlways("Nothing to restore")
+    end
 end
 
 ----------------------------------------------------------------------
@@ -534,8 +610,10 @@ function obj:startWatchers()
         logMsg(self, "Screen configuration changed")
         if self.state == "dimmed" or self.state == "dimming" then
             self:cancelFade()
+            hs.screen.restoreGamma()
             self.state = "idle"
             self.savedState = {}
+            self.savedGamma = {}
         end
     end)
     self.screenWatcher:start()
@@ -566,8 +644,10 @@ function obj:start()
     self.enabled    = true
     self.state      = "idle"
     self.savedState = {}
+    self.savedGamma = {}
     self:startWatchers()
-    logAlways("ScreenDimmer started (timeout=%ds)", self.config.idleTimeout)
+    logAlways("ScreenDimmer started (timeout=%ds, fade=%.1fs)",
+        self.config.idleTimeout, self.config.fadeDuration)
     return self
 end
 
@@ -577,6 +657,7 @@ function obj:stop()
         self:restoreScreens()
     end
     self:cancelFade()
+    hs.screen.restoreGamma()
     self:stopWatchers()
     for _, hk in ipairs(self.hotkeys) do hk:delete() end
     self.hotkeys = {}
