@@ -117,6 +117,13 @@ All parameters are optional — defaults are applied for any value not specified
 | `verifyDelay` | `1` | Seconds to wait after restore before verifying brightness |
 | `verifyRetries` | `2` | Max retry attempts if brightness doesn't match expected value |
 | `verifyTolerance` | `2` | Acceptable brightness deviation (±) during verification |
+| `screenChangeDebounce` | `2` | Seconds to wait for display add/remove events to settle |
+| `screenChangePollInterval` | `1` | Seconds between Lunar readiness checks after displays change |
+| `screenChangePollTimeout` | `20` | Give up display-change recovery after this many seconds |
+| `screenChangeIdleCooldown` | `10` | Suppress automatic re-dimming briefly after display changes |
+| `screenChangeDefaultBrightness` | `70` | Fallback brightness for newly seen displays with no remembered state |
+| `rememberBrightStates` | `true` | Persist last known bright brightness per display UUID |
+| `settingsKey` | `"ScreenDimmer.lastBrightState"` | `hs.settings` key used for persisted bright-state memory |
 
 ### Wake sequence
 
@@ -187,7 +194,7 @@ ScreenDimmer automatically handles:
 - **System sleep/wake** — polls Lunar for readiness before restoring after wake
 - **Screen lock/unlock** — restores on unlock, cancels fades on lock
 - **Screensaver start/stop** — restores brightness when screensaver starts (so monitors don't power down while dimmed), pauses idle checking while active
-- **Screen configuration changes** — restores to normal if displays are added/removed
+- **Screen configuration changes** — debounces add/remove events, waits for Lunar to see active displays, then restores each display to its last known bright brightness or the configured fallback
 - **Lunar crash** — detects unresponsive Lunar and auto-restarts it
 
 ## License

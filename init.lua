@@ -28,7 +28,7 @@ obj.__index = obj
 
 -- Spoon metadata
 obj.name = "ScreenDimmer"
-obj.version = "3.0"
+obj.version = "3.1"
 obj.author = ""
 obj.license = "MIT"
 
@@ -69,6 +69,15 @@ obj.defaults = {
     verifyRetries     = 2,         -- max retry attempts if brightness mismatch
     verifyTolerance   = 2,         -- acceptable brightness deviation (±)
 
+    -- Screen configuration recovery
+    screenChangeDebounce          = 2,   -- seconds to wait for add/remove events to settle
+    screenChangePollInterval      = 1,   -- seconds between Lunar readiness checks
+    screenChangePollTimeout       = 20,  -- give up after this many seconds
+    screenChangeIdleCooldown      = 10,  -- suppress re-dimming after topology changes
+    screenChangeDefaultBrightness = 70,  -- fallback when no bright state is known
+    rememberBrightStates          = true,
+    settingsKey                   = "ScreenDimmer.lastBrightState",
+
     -- Lunar health monitoring
     lunarHealthInterval  = 30,     -- seconds between health checks (0 to disable)
     lunarRestartCooldown = 120,    -- minimum seconds between auto-restart attempts
@@ -88,6 +97,7 @@ obj.config            = {}
 obj.state             = "idle"   -- idle | dimming | dimmed | restoring
 obj.savedState        = {}       -- per-UUID: { brightness, subzero, subzeroDimming, ... }
 obj.savedGamma        = {}       -- per-UUID: { whitepoint, blackpoint } from getGamma()
+obj.lastBrightState   = {}       -- persisted per-UUID bright-state cache
 obj.fadeTimer         = nil      -- hs.timer driving the gamma animation
 obj.fadeTask          = nil      -- hs.task for Lunar CLI commands
 obj.queryTask         = nil      -- hs.task for async display queries
@@ -104,6 +114,10 @@ obj.lunarHealthTask   = nil      -- hs.task for health check probe
 obj.lastLunarRestart  = 0        -- timestamp of last auto-restart
 obj.caffeinateWatcher = nil
 obj.screenWatcher     = nil
+obj.screenChangeTimer = nil
+obj.screenChangeToken = 0
+obj.screenChangeRestoreSources = {}
+obj.idleSuppressedUntil = 0
 obj.hotkeys           = {}
 
 ----------------------------------------------------------------------
@@ -124,6 +138,17 @@ end
 -- Lunar CLI helpers (fully async)
 ----------------------------------------------------------------------
 
+local function shellQuote(value)
+    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function expandHome(path)
+    if type(path) == "string" and path:sub(1, 2) == "~/" then
+        return (os.getenv("HOME") or "~") .. path:sub(2)
+    end
+    return path
+end
+
 --- Build a shell command string for setting one Lunar property.
 function obj:lunarCmd(serial, property, value)
     local v
@@ -138,7 +163,11 @@ function obj:lunarCmd(serial, property, value)
     else
         v = tostring(value)
     end
-    return string.format('%s displays "%s" %s %s', self.config.lunarPath, serial, property, v)
+    return string.format("%s displays %s %s %s",
+        shellQuote(self.config.lunarPath),
+        shellQuote(serial),
+        shellQuote(property),
+        shellQuote(v))
 end
 
 --- Run a list of shell commands as a single script (async, non-blocking).
@@ -157,6 +186,10 @@ function obj:runLunarScript(cmds, callback)
 
     self.fadeTask = hs.task.new("/bin/sh", function(exitCode, stdOut, stdErr)
         self.fadeTask = nil
+        if exitCode ~= 0 then
+            logAlways("Lunar script failed (exit=%s): %s",
+                tostring(exitCode), stdErr or "")
+        end
         if callback then callback(exitCode == 0) end
     end, {"-c", script})
     self.fadeTask:start()
@@ -259,6 +292,89 @@ local function screenForUUID(uuid)
     return nil
 end
 
+local function clampBrightness(value)
+    local n = tonumber(value)
+    if not n then return nil end
+    return math.max(0, math.min(100, math.floor(n + 0.5)))
+end
+
+local function copyDisplayState(state)
+    if not state then return nil end
+    local brightness = clampBrightness(state.brightness)
+    if not brightness then return nil end
+
+    return {
+        brightness     = brightness,
+        subzero        = state.subzero or false,
+        subzeroDimming = state.subzeroDimming or 1,
+        isInternal     = state.isInternal and true or false,
+        name           = state.name or "Unknown",
+        updated        = state.updated or hs.timer.secondsSinceEpoch(),
+    }
+end
+
+local function copyDisplayStates(states)
+    local result = {}
+    for serial, state in pairs(states or {}) do
+        local copy = copyDisplayState(state)
+        if copy then result[serial] = copy end
+    end
+    return result
+end
+
+local function tableCount(t)
+    local count = 0
+    for _ in pairs(t or {}) do count = count + 1 end
+    return count
+end
+
+function obj:loadBrightStateCache()
+    self.lastBrightState = {}
+    if not self.config.rememberBrightStates then return end
+
+    local saved = hs.settings.get(self.config.settingsKey)
+    if type(saved) ~= "table" then return end
+
+    for serial, state in pairs(saved) do
+        local copy = copyDisplayState(state)
+        if copy then self.lastBrightState[serial] = copy end
+    end
+    logMsg(self, "Loaded %d remembered display brightness state(s)",
+        tableCount(self.lastBrightState))
+end
+
+function obj:saveBrightStateCache()
+    if not self.config.rememberBrightStates then return end
+    hs.settings.set(self.config.settingsKey, self.lastBrightState)
+end
+
+function obj:rememberBrightState(serial, state, allowLow)
+    if not self.config.rememberBrightStates then return false end
+
+    local copy = copyDisplayState(state)
+    if not serial or not copy then return false end
+
+    if not allowLow then
+        local minBr = self:getMinBrightness(serial, copy.isInternal)
+        local likelyDimmedCeiling = math.max(minBr + self.config.verifyTolerance, 10)
+        if copy.brightness <= likelyDimmedCeiling then
+            return false
+        end
+    end
+
+    self.lastBrightState[serial] = copy
+    return true
+end
+
+function obj:rememberBrightStates(states, allowLow)
+    local changed = false
+    for serial, state in pairs(states or {}) do
+        changed = self:rememberBrightState(serial, state, allowLow) or changed
+    end
+    if changed then self:saveBrightStateCache() end
+    return changed
+end
+
 --- Run a smooth gamma fade across all displays simultaneously.
 ---
 --- `targets`: list of { uuid, fromWP, toWP }
@@ -271,8 +387,8 @@ function obj:runGammaFade(targets, callback)
         self.fadeTimer = nil
     end
 
-    local duration = self.config.fadeDuration
-    local interval = self.config.fadeInterval
+    local duration = math.max(tonumber(self.config.fadeDuration) or 0, 0)
+    local interval = math.max(tonumber(self.config.fadeInterval) or 0.033, 0.01)
     local gamma    = 2.2  -- perceptual correction
     local startTime = hs.timer.secondsSinceEpoch()
     local logging = self.config.logging
@@ -310,6 +426,17 @@ function obj:runGammaFade(targets, callback)
                 e.uuid:sub(1, 4), (e.from_p ^ gamma), e.toWP))
         end
         logAlways("Gamma fade: %s over %.1fs", table.concat(names, ", "), duration)
+    end
+
+    if duration == 0 then
+        for _, e in ipairs(fadeEntries) do
+            e.screen:setGamma(
+                { red = e.toWP, green = e.toWP, blue = e.toWP },
+                { red = 0,      green = 0,      blue = 0 }
+            )
+        end
+        if callback then callback() end
+        return
     end
 
     self.fadeTimer = hs.timer.doEvery(interval, function()
@@ -365,6 +492,7 @@ function obj:dimScreens()
         --   lunarCmds: all Lunar CLI commands (hardware brightness + subzero)
         local gammaTargets = {}
         local lunarCmds = {}
+        local rememberedBrightState = false
 
         for serial, d in pairs(displays) do
             local dimLevel = self:getDimLevel(serial, d.isInternal)
@@ -378,6 +506,8 @@ function obj:dimScreens()
                 isInternal     = d.isInternal,
                 name           = d.name,
             }
+            rememberedBrightState = self:rememberBrightState(
+                serial, self.savedState[serial], true) or rememberedBrightState
 
             local screen = screenForUUID(serial)
             if screen then
@@ -416,6 +546,7 @@ function obj:dimScreens()
                 -- dimLevel == 0: hardware minimum only, no gamma/subzero needed
             end
         end
+        if rememberedBrightState then self:saveBrightStateCache() end
 
         -- Run Lunar script and gamma fade in parallel
         local pending = 0
@@ -508,6 +639,7 @@ function obj:restoreScreens()
             -- Phase 2: restore hardware brightness
             local function onRestoreComplete(msg)
                 self.state = "idle"
+                self:rememberBrightStates(savedStateForVerify, true)
                 self.savedState = {}
                 self.savedGamma = {}
                 logAlways(msg)
@@ -534,6 +666,7 @@ function obj:restoreScreens()
 
         local function onRestoreComplete(msg)
             self.state = "idle"
+            self:rememberBrightStates(savedStateForVerify, true)
             self.savedState = {}
             self.savedGamma = {}
             logAlways(msg)
@@ -646,6 +779,7 @@ function obj:forceReset()
             cmds[#cmds + 1] = self:lunarCmd(serial, "adaptiveSubzero", true)
         end
         self:runLunarScript(cmds, nil)
+        self:rememberBrightStates(self.savedState, true)
     end
 
     self.state = "idle"
@@ -782,6 +916,136 @@ function obj:onActivity()
 end
 
 ----------------------------------------------------------------------
+-- Screen configuration recovery
+----------------------------------------------------------------------
+
+function obj:screenChangeTarget(serial, display, restoreSources)
+    restoreSources = restoreSources or {}
+    local source = restoreSources[serial] or self.lastBrightState[serial]
+    if source and source.brightness then
+        return clampBrightness(source.brightness), "remembered"
+    end
+
+    local current = clampBrightness(display.brightness)
+    local minBr = self:getMinBrightness(serial, display.isInternal)
+    local likelyDimmedCeiling = math.max(minBr + self.config.verifyTolerance, 10)
+
+    if current and current > likelyDimmedCeiling then
+        return current, "current"
+    end
+
+    return clampBrightness(self.config.screenChangeDefaultBrightness), "default"
+end
+
+function obj:restoreAfterScreenChange(restoreSources, token, startTime)
+    if token ~= self.screenChangeToken or not self.enabled then return end
+
+    self:getDisplaysAsync(function(displays)
+        if token ~= self.screenChangeToken or not self.enabled then return end
+
+        local elapsed = hs.timer.secondsSinceEpoch() - startTime
+        if not next(displays) then
+            if elapsed < self.config.screenChangePollTimeout then
+                logAlways("Screen change: Lunar not ready (%.1fs elapsed) — retrying", elapsed)
+                hs.timer.doAfter(self.config.screenChangePollInterval, function()
+                    self:restoreAfterScreenChange(restoreSources, token, startTime)
+                end)
+            else
+                self.screenChangeRestoreSources = {}
+                logAlways("Screen change: Lunar poll timed out after %.0fs", elapsed)
+            end
+            return
+        end
+
+        hs.screen.restoreGamma()
+        self.idleSuppressedUntil = hs.timer.secondsSinceEpoch() + self.config.screenChangeIdleCooldown
+
+        local cmds = {}
+        local expected = {}
+        local remembered = false
+
+        for serial, display in pairs(displays) do
+            local target, source = self:screenChangeTarget(serial, display, restoreSources)
+            if target then
+                local actual = clampBrightness(display.brightness) or 0
+                local state = {
+                    brightness     = target,
+                    subzero        = display.subzero,
+                    subzeroDimming = display.subzeroDimming,
+                    isInternal     = display.isInternal,
+                    name           = display.name,
+                }
+                expected[serial] = state
+                remembered = self:rememberBrightState(serial, state, true) or remembered
+
+                if math.abs(actual - target) > self.config.verifyTolerance then
+                    logAlways("Screen change: restore %s (%s…) %d → %d [%s]",
+                        display.name, serial:sub(1, 8), actual, target, source)
+                    table.insert(cmds, self:lunarCmd(serial, "brightness", target))
+                else
+                    logMsg(self, "Screen change: %s (%s…) already at %d [%s]",
+                        display.name, serial:sub(1, 8), actual, source)
+                end
+            end
+
+            table.insert(cmds, self:lunarCmd(serial, "adaptiveSubzero", true))
+        end
+
+        if remembered then self:saveBrightStateCache() end
+
+        self.state = "idle"
+        self.savedState = {}
+        self.savedGamma = {}
+        self.screenChangeRestoreSources = {}
+
+        local function complete()
+            logAlways("Screen change recovery complete (%d display(s))", tableCount(displays))
+            self:scheduleVerification(expected)
+        end
+
+        if #cmds > 0 then
+            self:runLunarScript(cmds, function(ok) complete() end)
+        else
+            complete()
+        end
+    end)
+end
+
+function obj:onScreenConfigurationChanged()
+    local now = hs.timer.secondsSinceEpoch()
+    local wasDimmed = (self.state == "dimmed" or self.state == "dimming" or self.state == "restoring")
+    local restoreSources = copyDisplayStates(self.savedState)
+
+    logAlways("Screen configuration changed%s",
+        wasDimmed and " while dimmed/restoring" or "")
+
+    self.screenChangeToken = self.screenChangeToken + 1
+    self.idleSuppressedUntil = now + self.config.screenChangeIdleCooldown
+    self.screenChangeRestoreSources = self.screenChangeRestoreSources or {}
+    for serial, state in pairs(restoreSources) do
+        self.screenChangeRestoreSources[serial] = state
+    end
+
+    if self.screenChangeTimer then
+        self.screenChangeTimer:stop()
+        self.screenChangeTimer = nil
+    end
+
+    self:cancelFade()
+    hs.screen.restoreGamma()
+    self.state = "idle"
+    self.savedState = {}
+    self.savedGamma = {}
+
+    local token = self.screenChangeToken
+    self.screenChangeTimer = hs.timer.doAfter(self.config.screenChangeDebounce, function()
+        self.screenChangeTimer = nil
+        self:restoreAfterScreenChange(
+            copyDisplayStates(self.screenChangeRestoreSources), token, now)
+    end)
+end
+
+----------------------------------------------------------------------
 -- Watchers
 ----------------------------------------------------------------------
 
@@ -802,6 +1066,7 @@ function obj:startWatchers()
     self.idleCheckTimer = hs.timer.doEvery(self.config.checkInterval, function()
         if not self.enabled or self.state ~= "idle" then return end
         if self.screensaverActive then return end
+        if hs.timer.secondsSinceEpoch() < self.idleSuppressedUntil then return end
         if hs.host.idleTime() >= self.config.idleTimeout then
             self:dimScreens()
         end
@@ -863,14 +1128,7 @@ function obj:startWatchers()
     self.caffeinateWatcher:start()
 
     self.screenWatcher = hs.screen.watcher.new(function()
-        logMsg(self, "Screen configuration changed")
-        if self.state == "dimmed" or self.state == "dimming" then
-            self:cancelFade()
-            hs.screen.restoreGamma()
-            self.state = "idle"
-            self.savedState = {}
-            self.savedGamma = {}
-        end
+        self:onScreenConfigurationChanged()
     end)
     self.screenWatcher:start()
 end
@@ -884,6 +1142,8 @@ function obj:stopWatchers()
         if self.lunarHealthTask:isRunning() then self.lunarHealthTask:terminate() end
         self.lunarHealthTask = nil
     end
+    if self.screenChangeTimer then self.screenChangeTimer:stop(); self.screenChangeTimer = nil end
+    self.screenChangeRestoreSources = {}
     if self.caffeinateWatcher then self.caffeinateWatcher:stop(); self.caffeinateWatcher = nil end
     if self.screenWatcher     then self.screenWatcher:stop();     self.screenWatcher = nil     end
 end
@@ -898,6 +1158,8 @@ function obj:configure(config)
     if config then
         for k, v in pairs(config) do self.config[k] = v end
     end
+    self.config.lunarPath = expandHome(self.config.lunarPath)
+    if type(self.config.displays) ~= "table" then self.config.displays = {} end
     return self
 end
 
@@ -917,6 +1179,8 @@ function obj:start()
     self.state      = "idle"
     self.savedState = {}
     self.savedGamma = {}
+    self:loadBrightStateCache()
+    self:stopWatchers()
     self:startWatchers()
     logAlways("ScreenDimmer started (timeout=%ds, fade=%.1fs)",
         self.config.idleTimeout, self.config.fadeDuration)
@@ -925,11 +1189,12 @@ end
 
 function obj:stop()
     self.enabled = false
-    if self.state == "dimmed" or self.state == "dimming" then
-        self:restoreScreens()
+    if self.state == "dimmed" or self.state == "dimming" or self.state == "restoring" then
+        self:forceReset()
+    else
+        self:cancelFade()
+        hs.screen.restoreGamma()
     end
-    self:cancelFade()
-    hs.screen.restoreGamma()
     self:stopWatchers()
     -- Hotkeys are intentionally NOT deleted here so toggle can re-enable
     logAlways("ScreenDimmer stopped")
