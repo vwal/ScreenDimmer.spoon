@@ -75,6 +75,7 @@ obj.defaults = {
     screenChangePollTimeout       = 20,  -- give up after this many seconds
     screenChangeIdleCooldown      = 10,  -- suppress re-dimming after topology changes
     screenChangeDefaultBrightness = 70,  -- fallback when no bright state is known
+    screenChangeHealthSuppress    = 30,  -- after a screen change, suppress Lunar health kill/restart for this many seconds
     rememberBrightStates          = true,
     settingsKey                   = "ScreenDimmer.lastBrightState",
 
@@ -115,7 +116,11 @@ obj.caffeinateWatcher = nil
 obj.screenWatcher     = nil
 obj.screenChangeTimer = nil
 obj.screenChangeToken = 0
-obj.screenChangeRestoreSources = {}
+obj.screenChangeRestoreSources = {}  -- accumulated per-UUID restore sources across change events
+obj.screenChangePending = {}     -- per-UUID restore sources still awaiting their display to reappear
+obj.screenChangeExpected = {}    -- cumulative per-UUID state actually restored (for verification)
+obj.screenChangeSeen = {}        -- per-UUID: true once a display has appeared during this recovery
+obj.lastScreenChange  = 0        -- timestamp of most recent screen-configuration change
 obj.idleSuppressedUntil = 0
 obj.hotkeys           = {}
 
@@ -468,7 +473,7 @@ end
 ----------------------------------------------------------------------
 
 function obj:dimScreens()
-    if self.state == "dimming" or self.state == "dimmed" then return end
+    if self.state == "dimming" or self.state == "dimmed" or self.state == "restoring" then return end
 
     logAlways("Starting dim sequence")
     self.state = "dimming"
@@ -818,6 +823,15 @@ end
 function obj:checkLunarHealth()
     if self.config.lunarHealthInterval <= 0 then return end
 
+    -- While macOS re-enumerates displays after a screen change, Lunar is
+    -- legitimately busy and its CLI may transiently hang. Don't kill/restart it
+    -- in that window — doing so would abort an in-flight screen-change recovery.
+    local sinceScreenChange = hs.timer.secondsSinceEpoch() - self.lastScreenChange
+    if sinceScreenChange < self.config.screenChangeHealthSuppress then
+        logMsg(self, "Lunar health: skipped (%.0fs since screen change)", sinceScreenChange)
+        return
+    end
+
     -- Step 1: Is the process running?
     if not self:isLunarRunning() then
         logAlways("Lunar health: process not running")
@@ -927,75 +941,134 @@ function obj:screenChangeTarget(serial, display, restoreSources)
     return clampBrightness(self.config.screenChangeDefaultBrightness), "default"
 end
 
-function obj:restoreAfterScreenChange(restoreSources, token, startTime)
+--- Finish a screen-change recovery: clear transient state and verify the full
+--- cumulative set of displays we restored across all polls. Single clear point.
+function obj:finalizeScreenChange(token)
+    if token ~= self.screenChangeToken then return end
+
+    hs.screen.restoreGamma()  -- final global sweep for anything missed
+    self.state = "idle"
+    self.savedState = {}
+
+    local expected = self.screenChangeExpected
+
+    -- Report any displays we owed a restore but that never came back within the
+    -- timeout (e.g. a closed-lid built-in, or an external that was unplugged).
+    local leftover = {}
+    for serial, state in pairs(self.screenChangePending) do
+        table.insert(leftover, string.format("%s (%s…)", state.name or "?", serial:sub(1, 8)))
+    end
+    if #leftover > 0 then
+        logAlways("Screen change recovery complete (%d restored; %d never returned: %s)",
+            tableCount(expected), #leftover, table.concat(leftover, ", "))
+    else
+        logAlways("Screen change recovery complete (%d display(s))", tableCount(expected))
+    end
+
+    self.screenChangeRestoreSources = {}
+    self.screenChangePending        = {}
+    self.screenChangeExpected       = {}
+    self.screenChangeSeen           = {}
+
+    self:scheduleVerification(expected)
+end
+
+--- Incremental recovery poller. Restores each owed display as it reappears in
+--- Lunar's active set (so a built-in that re-registers later than the externals
+--- is not dropped), polling until nothing is still owed or the timeout elapses.
+function obj:restoreAfterScreenChange(token, startTime)
     if token ~= self.screenChangeToken or not self.enabled then return end
 
     self:getDisplaysAsync(function(displays)
         if token ~= self.screenChangeToken or not self.enabled then return end
 
         local elapsed = hs.timer.secondsSinceEpoch() - startTime
+        local timedOut = elapsed >= self.config.screenChangePollTimeout
+
+        -- Lunar not ready yet: keep polling until timeout, then best-effort finalize.
         if not next(displays) then
-            if elapsed < self.config.screenChangePollTimeout then
+            if not timedOut then
                 logAlways("Screen change: Lunar not ready (%.1fs elapsed) — retrying", elapsed)
                 hs.timer.doAfter(self.config.screenChangePollInterval, function()
-                    self:restoreAfterScreenChange(restoreSources, token, startTime)
+                    self:restoreAfterScreenChange(token, startTime)
                 end)
             else
-                self.screenChangeRestoreSources = {}
                 logAlways("Screen change: Lunar poll timed out after %.0fs", elapsed)
+                self:finalizeScreenChange(token)
             end
             return
         end
 
-        hs.screen.restoreGamma()
+        -- Keep idle-dimming suppressed for the whole (possibly multi-second) recovery.
         self.idleSuppressedUntil = hs.timer.secondsSinceEpoch() + self.config.screenChangeIdleCooldown
 
         local cmds = {}
-        local expected = {}
         local remembered = false
+        local newDisplay = false
 
         for serial, display in pairs(displays) do
-            local target, source = self:screenChangeTarget(serial, display, restoreSources)
-            if target then
-                local actual = clampBrightness(display.brightness) or 0
-                local state = {
-                    brightness     = target,
-                    subzero        = display.subzero,
-                    subzeroDimming = display.subzeroDimming,
-                    isInternal     = display.isInternal,
-                    name           = display.name,
-                }
-                expected[serial] = state
-                remembered = self:rememberBrightState(serial, state, true) or remembered
+            -- First time we see this display during the recovery: a fresh global
+            -- gamma restore clears any overlay still sitting on it (e.g. a built-in
+            -- that re-registered after the initial restoreGamma).
+            if not self.screenChangeSeen[serial] then
+                self.screenChangeSeen[serial] = true
+                newDisplay = true
+            end
 
-                if math.abs(actual - target) > self.config.verifyTolerance then
-                    logAlways("Screen change: restore %s (%s…) %d → %d [%s]",
-                        display.name, serial:sub(1, 8), actual, target, source)
-                    table.insert(cmds, self:lunarCmd(serial, "brightness", target))
-                else
-                    logMsg(self, "Screen change: %s (%s…) already at %d [%s]",
-                        display.name, serial:sub(1, 8), actual, source)
+            -- Restore a display once: either one we owed (pending) or one that is
+            -- brand-new this recovery (never dimmed but worth re-asserting).
+            local isPending = self.screenChangePending[serial] ~= nil
+            local isNew     = self.screenChangeExpected[serial] == nil
+            if isPending or isNew then
+                local target, source = self:screenChangeTarget(
+                    serial, display, self.screenChangeRestoreSources)
+                if target then
+                    local actual = clampBrightness(display.brightness) or 0
+                    local state = {
+                        brightness     = target,
+                        subzero        = display.subzero,
+                        subzeroDimming = display.subzeroDimming,
+                        isInternal     = display.isInternal,
+                        name           = display.name,
+                    }
+                    self.screenChangeExpected[serial] = state
+                    remembered = self:rememberBrightState(serial, state, true) or remembered
+
+                    if math.abs(actual - target) > self.config.verifyTolerance then
+                        logAlways("Screen change: restore %s (%s…) %d → %d [%s]",
+                            display.name, serial:sub(1, 8), actual, target, source)
+                        table.insert(cmds, self:lunarCmd(serial, "brightness", target))
+                    else
+                        logMsg(self, "Screen change: %s (%s…) already at %d [%s]",
+                            display.name, serial:sub(1, 8), actual, source)
+                    end
+                    table.insert(cmds, self:lunarCmd(serial, "adaptiveSubzero", true))
                 end
             end
 
-            table.insert(cmds, self:lunarCmd(serial, "adaptiveSubzero", true))
+            -- This display has appeared and been handled; stop owing it.
+            self.screenChangePending[serial] = nil
         end
 
+        if newDisplay then hs.screen.restoreGamma() end
         if remembered then self:saveBrightStateCache() end
 
-        self.state = "idle"
-        self.savedState = {}
-        self.screenChangeRestoreSources = {}
-
-        local function complete()
-            logAlways("Screen change recovery complete (%d display(s))", tableCount(displays))
-            self:scheduleVerification(expected)
+        local function afterCmds()
+            if token ~= self.screenChangeToken then return end
+            -- Keep polling while we still owe a display a restore and time remains.
+            if next(self.screenChangePending) ~= nil and not timedOut then
+                hs.timer.doAfter(self.config.screenChangePollInterval, function()
+                    self:restoreAfterScreenChange(token, startTime)
+                end)
+            else
+                self:finalizeScreenChange(token)
+            end
         end
 
         if #cmds > 0 then
-            self:runLunarScript(cmds, function(ok) complete() end)
+            self:runLunarScript(cmds, function(ok) afterCmds() end)
         else
-            complete()
+            afterCmds()
         end
     end)
 end
@@ -1008,12 +1081,28 @@ function obj:onScreenConfigurationChanged()
     logAlways("Screen configuration changed%s",
         wasDimmed and " while dimmed/restoring" or "")
 
+    self.lastScreenChange = now
     self.screenChangeToken = self.screenChangeToken + 1
     self.idleSuppressedUntil = now + self.config.screenChangeIdleCooldown
+
+    -- Accumulate restore sources across rapid successive change events (savedState
+    -- is only populated on the first event; later events in a burst snapshot {}).
     self.screenChangeRestoreSources = self.screenChangeRestoreSources or {}
     for serial, state in pairs(restoreSources) do
         self.screenChangeRestoreSources[serial] = state
     end
+
+    -- (Re)seed the pending set from the full accumulated restore sources so every
+    -- display we owe a restore stays tracked until it reappears. Merge (not
+    -- overwrite) so a display still owed by an interrupted recovery isn't lost.
+    self.screenChangePending = self.screenChangePending or {}
+    for serial, state in pairs(self.screenChangeRestoreSources) do
+        self.screenChangePending[serial] = state
+    end
+
+    -- Reset per-recovery transient sets under the new token.
+    self.screenChangeExpected = {}
+    self.screenChangeSeen     = {}
 
     if self.screenChangeTimer then
         self.screenChangeTimer:stop()
@@ -1028,8 +1117,7 @@ function obj:onScreenConfigurationChanged()
     local token = self.screenChangeToken
     self.screenChangeTimer = hs.timer.doAfter(self.config.screenChangeDebounce, function()
         self.screenChangeTimer = nil
-        self:restoreAfterScreenChange(
-            copyDisplayStates(self.screenChangeRestoreSources), token, now)
+        self:restoreAfterScreenChange(token, now)
     end)
 end
 
@@ -1132,6 +1220,9 @@ function obj:stopWatchers()
     end
     if self.screenChangeTimer then self.screenChangeTimer:stop(); self.screenChangeTimer = nil end
     self.screenChangeRestoreSources = {}
+    self.screenChangePending = {}
+    self.screenChangeExpected = {}
+    self.screenChangeSeen = {}
     if self.caffeinateWatcher then self.caffeinateWatcher:stop(); self.caffeinateWatcher = nil end
     if self.screenWatcher     then self.screenWatcher:stop();     self.screenWatcher = nil     end
 end
