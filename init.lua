@@ -96,7 +96,6 @@ obj.defaults = {
 obj.config            = {}
 obj.state             = "idle"   -- idle | dimming | dimmed | restoring
 obj.savedState        = {}       -- per-UUID: { brightness, subzero, subzeroDimming, ... }
-obj.savedGamma        = {}       -- per-UUID: { whitepoint, blackpoint } from getGamma()
 obj.lastBrightState   = {}       -- persisted per-UUID bright-state cache
 obj.fadeTimer         = nil      -- hs.timer driving the gamma animation
 obj.fadeTask          = nil      -- hs.task for Lunar CLI commands
@@ -476,7 +475,6 @@ function obj:dimScreens()
     self.dimStartTime = hs.timer.secondsSinceEpoch()
     self.stateChangeTime = self.dimStartTime
     self.savedState = {}
-    self.savedGamma = {}
 
     self:getDisplaysAsync(function(displays)
         if self.state ~= "dimming" then return end
@@ -508,11 +506,6 @@ function obj:dimScreens()
             }
             rememberedBrightState = self:rememberBrightState(
                 serial, self.savedState[serial], true) or rememberedBrightState
-
-            local screen = screenForUUID(serial)
-            if screen then
-                self.savedGamma[serial] = screen:getGamma()
-            end
 
             -- Disable adaptive subzero for all displays during dimming
             table.insert(lunarCmds, self:lunarCmd(serial, "adaptiveSubzero", false))
@@ -641,7 +634,6 @@ function obj:restoreScreens()
                 self.state = "idle"
                 self:rememberBrightStates(savedStateForVerify, true)
                 self.savedState = {}
-                self.savedGamma = {}
                 logAlways(msg)
                 self:scheduleVerification(savedStateForVerify)
             end
@@ -668,7 +660,6 @@ function obj:restoreScreens()
             self.state = "idle"
             self:rememberBrightStates(savedStateForVerify, true)
             self.savedState = {}
-            self.savedGamma = {}
             logAlways(msg)
             self:scheduleVerification(savedStateForVerify)
         end
@@ -784,7 +775,6 @@ function obj:forceReset()
 
     self.state = "idle"
     self.savedState = {}
-    self.savedGamma = {}
     logAlways("Safety reset complete")
 end
 
@@ -995,7 +985,6 @@ function obj:restoreAfterScreenChange(restoreSources, token, startTime)
 
         self.state = "idle"
         self.savedState = {}
-        self.savedGamma = {}
         self.screenChangeRestoreSources = {}
 
         local function complete()
@@ -1035,7 +1024,6 @@ function obj:onScreenConfigurationChanged()
     hs.screen.restoreGamma()
     self.state = "idle"
     self.savedState = {}
-    self.savedGamma = {}
 
     local token = self.screenChangeToken
     self.screenChangeTimer = hs.timer.doAfter(self.config.screenChangeDebounce, function()
@@ -1178,7 +1166,6 @@ function obj:start()
     self.enabled    = true
     self.state      = "idle"
     self.savedState = {}
-    self.savedGamma = {}
     self:loadBrightStateCache()
     self:stopWatchers()
     self:startWatchers()
