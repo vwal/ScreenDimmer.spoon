@@ -925,17 +925,30 @@ end
 
 function obj:screenChangeTarget(serial, display, restoreSources)
     restoreSources = restoreSources or {}
-    local source = restoreSources[serial] or self.lastBrightState[serial]
-    if source and source.brightness then
-        return clampBrightness(source.brightness), "remembered"
-    end
-
     local current = clampBrightness(display.brightness)
     local minBr = self:getMinBrightness(serial, display.isInternal)
     local likelyDimmedCeiling = math.max(minBr + self.config.verifyTolerance, 10)
+    local owedRestore = restoreSources[serial]
 
+    -- If this display was dimmed/restoring when the topology changed, the saved
+    -- bright state is a real restore target and should override Lunar's current
+    -- value, which may still be the dimmed minimum.
+    if owedRestore and owedRestore.brightness then
+        return clampBrightness(owedRestore.brightness), "saved"
+    end
+
+    -- For ordinary screen-change noise while the machine is in use, treat the
+    -- current Lunar value as the user's intent. This prevents a stale remembered
+    -- value from fighting manual brightness adjustments.
     if current and current > likelyDimmedCeiling then
         return current, "current"
+    end
+
+    -- If the current value looks like a stuck dim value, then fall back to the
+    -- remembered bright state or the configured default.
+    local remembered = self.lastBrightState[serial]
+    if remembered and remembered.brightness then
+        return clampBrightness(remembered.brightness), "remembered"
     end
 
     return clampBrightness(self.config.screenChangeDefaultBrightness), "default"
